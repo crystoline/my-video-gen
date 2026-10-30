@@ -1,0 +1,6 @@
+# One topic per line. Each scheduled run takes the top one and moves it to topics_done.txt.
+Why is Mars red?
+How do auroras actually form?
+What would happen if the Moon disappeared?
+How do we know the age of the universe?
+Why does Earth have seasons?

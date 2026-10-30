@@ -1,0 +1,19 @@
+# Secrets and login tokens
+.env
+client_secret.json
+youtube_token.json
+
+# Generated videos, audio, downloaded assets and queue state
+projects/
+topics_done.txt
+topics_failed.txt
+pipeline.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Windows download markers
+*:Zone.Identifier

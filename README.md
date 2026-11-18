@@ -113,6 +113,15 @@ A run that fails keeps its topic at the top of the queue and resumes next time. 
 
 In unattended mode, videos still upload as **private**. Watch each one in YouTube Studio before making it public. This review step is what keeps the channel on the right side of YouTube's "inauthentic content" policy, and it catches the occasional science error or mismatched visual.
 
+## 6. Tests
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+The tests replace Claude, ElevenLabs, the stock searches and YouTube with fakes and work in a temporary folder, so they cost nothing and never touch your `.env`, `topics.txt` or `projects/`. Rendering and sound tests use your real FFmpeg and are skipped if it is not installed. A full run takes a minute or two.
+
 ## Things to know
 
 - **API audit.** Google locks videos uploaded through an *unverified* API project to private. To publish from the API, apply for the YouTube API compliance audit. Until then, upload as private and switch videos to public manually in Studio, if your project allows it.

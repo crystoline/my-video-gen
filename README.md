@@ -8,7 +8,7 @@ Turns a topic like "Why is Mars red?" into a finished, captioned 1080p YouTube v
 2. A second Claude pass fact-checks the script, searching the web for primary sources.
 3. You review the script.
 4. ElevenLabs narrates it.
-5. Visuals come from NASA's image library (space, planets, Earth from orbit) and Pexels (Earth footage).
+5. Visuals come from NASA's image library (space, planets, Earth from orbit) and stock footage from Pexels and/or Pixabay (Earth subjects).
 6. FFmpeg renders the video with slow zooms on still images and cross-fades between scenes.
 7. The script makes word-accurate captions and a thumbnail.
 8. It uploads to YouTube.
@@ -39,14 +39,14 @@ If your system Python is older than 3.10 (Ubuntu 20.04 ships 3.8), get a newer o
 
 - **Anthropic:** create an API key at console.anthropic.com. `ANTHROPIC_MODEL` writes the script; `ANTHROPIC_FACTCHECK_MODEL` checks it and may run up to `FACTCHECK_SEARCHES` web searches per video (set it to 0 to check from memory only).
 - **ElevenLabs:** create an API key, then pick or design a voice and copy its Voice ID. Pick one voice and keep it; it becomes your channel's identity.
-- **Pexels:** get a free API key at pexels.com/api. The NASA library needs no key.
+- **Stock footage:** set `PIXABAY_API_KEY` (free; the key is shown at pixabay.com/api/docs once you log in) and/or `PEXELS_API_KEY` (pexels.com/api, which paused issuing new keys in 2026). Pexels is tried first when both are set. With neither, every scene uses NASA imagery, which is weak for Earth-bound subjects. The NASA library needs no key.
 - **YouTube:** set this up in Google Cloud Console.
   1. Create a project and enable **YouTube Data API v3**.
   2. Configure the **OAuth consent screen** and add your Google account as a test user.
   3. Go to Credentials → Create **OAuth client ID** → type **Desktop app**.
   4. Download the JSON file and save it as `client_secret.json` next to `pipeline.py`.
 
-  The first upload opens a browser for you to log in. After that, the login token is saved. Paths in `.env` are relative to `pipeline.py`, so the pipeline works from any working directory.
+  Sign in once with `python pipeline.py --login`, which opens a browser and saves the login token. Otherwise the first interactive upload asks you to sign in. Paths in `.env` are relative to `pipeline.py`, so the pipeline works from any working directory.
 
 ## 3. Run
 
@@ -69,7 +69,7 @@ The script pauses after writing. At that point:
 2. Edit `script.json` if you want to change anything.
 3. Press Enter to continue.
 
-If you edit narration later, re-running regenerates only the changed voiceover clips and re-renders only the scenes whose length changed, so picture and sound stay in sync. To swap one scene's visual, delete its file in `assets/` and its segment in `segments/`.
+If you edit narration later, re-running regenerates only the changed voiceover clips and re-renders only the scenes whose length changed, so picture and sound stay in sync. To swap one scene's visual from the command line, delete its file in `assets/`; the next run fetches the next-best match and re-renders that scene. The web interface does this with one click.
 
 **Other options**
 
@@ -78,7 +78,26 @@ If you edit narration later, re-running regenerates only the changed voiceover c
 - `--project projects/<folder>` resumes a project.
 - `CROSSFADE` in `.env` is the cross-fade length in seconds (default 0.5). Set it to 0 for hard cuts, which also skips a re-encode and renders faster.
 
-## 4. Automate
+## 4. Web interface
+
+For reviewing and re-working videos, a local web interface is easier than editing JSON files:
+
+```bash
+.venv/bin/python webui.py
+```
+
+Then open http://localhost:8765. From WSL, open it in your normal Windows browser. It only accepts connections from this computer. Stop it with Ctrl+C.
+
+- **Videos:** start a video from a topic, and see where every video stands.
+- **Script:** edit the title, description, tags and each scene's narration and visual search. Apply the fact-checker's fixes with one click, and move, add or delete scenes. Narration clips and visuals follow their scene when you reorder, so nothing is narrated twice. Each scene shows whether its narration clip is current or will be regenerated, with its character count.
+- **Visuals:** see every scene's image or clip. Swap a visual for the next search result, search with new words, or upload your own image or video. Pick the thumbnail background.
+- **Video:** render, watch, preview the sound, update the thumbnail, and upload to YouTube with privacy and schedule options.
+- **Topic queue:** reorder `topics.txt`, start a video from any topic, and send failed topics back to the queue.
+- **Settings:** music file, music level, ducking, voice tone and ElevenLabs voice settings, with a 45-second preview mixed from a real video. Settings are saved to `.env`, so the command line uses them too.
+
+Anything that spends money asks first and shows the ElevenLabs character count. Jobs run one at a time, and their logs are kept in each project's `activity.log`. The web interface and the command line work on the same project folders, so you can mix them.
+
+## 5. Automate
 
 Put topics in `topics.txt`, one per line. Each run takes the top topic, builds and uploads it, then moves it to `topics_done.txt`. The `--yes` flag skips the review pause and auto-applies the fact-checker's fixes.
 
@@ -97,13 +116,15 @@ In unattended mode, videos still upload as **private**. Watch each one in YouTub
 ## Things to know
 
 - **API audit.** Google locks videos uploaded through an *unverified* API project to private. To publish from the API, apply for the YouTube API compliance audit. Until then, upload as private and switch videos to public manually in Studio, if your project allows it.
-- **Login expiry.** If your OAuth app stays in "Testing" mode, the login expires about every 7 days. Set the consent screen's publishing status to "In production" to avoid this. For personal use you can click through the "unverified app" warning. When the saved login has expired, an interactive run opens the browser to sign in again; an unattended run stops and asks you to do that.
+- **Login expiry.** If your OAuth app stays in "Testing" mode, the login expires about every 7 days. Set the consent screen's publishing status to "In production" to avoid this. For personal use you can click through the "unverified app" warning. When the saved login has expired, run `python pipeline.py --login` to sign in again. Unattended runs and the web interface stop with that instruction instead of spending money on narration.
 - **Upload quota.** The default daily quota is enough for a few uploads per day. Each upload, caption and thumbnail uses some of it.
 - **Custom thumbnails** require a verified channel (youtube.com/verify).
-- **Image rights.** NASA imagery is generally free to use, but some images in the library belong to partners such as ESA or universities. Check the credit, and never imply NASA endorses your channel. Pexels footage is free to use. Credits for both are added to the video description automatically.
-- **Costs.** Pexels and NASA are free. The script costs a few cents; the fact-check costs a few cents more plus about one cent per web search. ElevenLabs is the main cost: a 6-minute video is roughly 5,000–6,000 characters, and `review.md` shows the exact count before you commit.
-- **Transient errors.** Calls to ElevenLabs, Pexels and NASA retry automatically on rate limits and server errors before the run gives up.
-- **Music.** Use only tracks you have the rights to, such as the YouTube Audio Library.
+- **Image rights.** NASA imagery is generally free to use, but some images in the library belong to partners such as ESA or universities. Check the credit, and never imply NASA endorses your channel. Pexels and Pixabay footage is free to use under their content licences. Credits for all sources are added to the video description automatically. Standard Pixabay keys serve photos at most 1280 px wide, so Pixabay stills are upscaled to 1080p; Pexels photos, when available, come at full size.
+- **Costs.** Pexels, Pixabay and NASA are free. The script costs a few cents; the fact-check costs a few cents more plus about one cent per web search. ElevenLabs is the main cost: a 6-minute video is roughly 5,000–6,000 characters, and `review.md` shows the exact count before you commit.
+- **Transient errors.** Calls to ElevenLabs, Pexels, Pixabay and NASA retry automatically on rate limits and server errors before the run gives up.
+- **Music.** Set `MUSIC_PATH` to an audio file and it loops under the narration. The pipeline measures the track's loudness, so `MUSIC_VOLUME` means the same thing with any track: 0.10 puts the music 20 dB below the voice, 0.05 puts it 26 dB below. With `MUSIC_DUCKING` on (the default), the music also dips about 6 dB while the narrator speaks and comes back up in pauses. A wrong path stops the run at startup rather than silently leaving the music out. Use only tracks you have the rights to, such as the YouTube Audio Library.
+- **Voice sound.** `VOICE_TONE` shapes the narration in the final mix: `soft` (the default) tames harsh "s" sounds and the 3 kHz edge and adds a little body, `warm` does more of the same, and `natural` leaves the ElevenLabs audio untouched. The ElevenLabs settings `VOICE_STABILITY`, `VOICE_SIMILARITY`, `VOICE_STYLE`, `VOICE_SPEAKER_BOOST` and `VOICE_SPEED` change how new narration is generated; existing clips keep their sound until they are re-voiced.
+- **Re-mixing is cheap.** Music and voice-tone changes apply when the final video is mixed. Re-running a finished project with `--project` reuses every rendered scene and only re-mixes the audio.
 
 ## Ideas for later
 

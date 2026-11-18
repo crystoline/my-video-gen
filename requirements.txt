@@ -7,3 +7,4 @@ Pillow>=10.1
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
+flask>=3

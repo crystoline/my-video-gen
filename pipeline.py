@@ -3,7 +3,7 @@
 Faceless science / Earth / astronomy video pipeline.
 
   topic -> script (Claude) -> fact-check (Claude + web search) -> your review
-        -> voiceover (ElevenLabs) -> visuals (NASA Image Library + Pexels)
+        -> voiceover (ElevenLabs) -> visuals (NASA Image Library + Pexels/Pixabay stock)
         -> render (FFmpeg) -> captions + thumbnail -> YouTube upload (private by default)
 
 Every topic gets its own folder under projects/. Each step saves its output there,
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -51,22 +52,58 @@ def _path(name: str, default: str) -> Path:
 # ----------------------------------------------------------------------------
 # Configuration (set these in .env)
 # ----------------------------------------------------------------------------
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
-FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
-FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
-ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-MUSIC_PATH = _path("MUSIC_PATH", "") if os.getenv("MUSIC_PATH") else None
-MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
-CROSSFADE = float(os.getenv("CROSSFADE", "0.5"))
-YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
-YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
-THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
-PROJECTS_DIR = _path("PROJECTS_DIR", "projects")
-MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+def _flag(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return default if not value else value not in ("0", "false", "no", "off")
 
+
+# Post-processing applied to the narration in the final mix (free, no re-synthesis needed).
+# "natural" leaves the ElevenLabs audio untouched; "soft" and "warm" tame harsh "s" sounds and
+# the 3 kHz presence peak and add a little low-end body.
+VOICE_TONES = {
+    "natural": [],
+    "soft": ["highpass=f=70", "deesser=i=0.4", "equalizer=f=3200:t=q:w=1.0:g=-4",
+             "treble=g=-4:f=7000", "bass=g=1.5:f=150"],
+    "warm": ["highpass=f=70", "deesser=i=0.6", "equalizer=f=3000:t=q:w=1.0:g=-6",
+             "treble=g=-7:f=6000", "bass=g=3:f=160"],
+}
+
+
+def configure() -> None:
+    """Read settings from the environment (.env). Called at import, and again by the web UI after it saves settings."""
+    global ANTHROPIC_MODEL, FACTCHECK_MODEL, FACTCHECK_SEARCHES, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
+    global ELEVENLABS_MODEL, VOICE_STABILITY, VOICE_SIMILARITY, VOICE_STYLE, VOICE_SPEAKER_BOOST, VOICE_SPEED
+    global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
+    global YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+    FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
+    FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+    ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+    ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+    # ElevenLabs voice settings; they only affect narration generated after a change
+    VOICE_STABILITY = float(os.getenv("VOICE_STABILITY", "0.5"))
+    VOICE_SIMILARITY = float(os.getenv("VOICE_SIMILARITY", "0.75"))
+    VOICE_STYLE = float(os.getenv("VOICE_STYLE", "0"))
+    VOICE_SPEAKER_BOOST = _flag("VOICE_SPEAKER_BOOST", True)
+    VOICE_SPEED = float(os.getenv("VOICE_SPEED", "1.0"))
+    VOICE_TONE = os.getenv("VOICE_TONE", "soft").strip().lower() or "soft"
+    PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+    PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+    MUSIC_PATH = _path("MUSIC_PATH", "") if os.getenv("MUSIC_PATH") else None
+    MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
+    MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
+    CROSSFADE = float(os.getenv("CROSSFADE", "0.5"))
+    YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
+    YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
+    THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
+    PROJECTS_DIR = _path("PROJECTS_DIR", "projects")
+    MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+
+
+configure()
+
+VOICE_LUFS = -14.0         # narration loudness in the final mix (YouTube's reference level)
 W, H, FPS = 1920, 1080, 30
 SCENE_PAD = 0.35           # seconds of breathing room after each narrated scene
 WORDS_PER_MINUTE = 150
@@ -78,8 +115,14 @@ ENCODE = ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv
 # ----------------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------------
+LOG_HOOKS: list = []   # extra receivers for log lines (the web UI uses this to show job progress)
+
+
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+    line = f"[{datetime.now():%H:%M:%S}] {msg}"
+    print(line, flush=True)
+    for hook in LOG_HOOKS:
+        hook(line)
 
 
 def run(cmd: list) -> str:
@@ -117,6 +160,20 @@ def ffmpeg_has_filter(name: str) -> bool:
     return name in _FILTERS
 
 
+_FILTER_OPTIONS: dict = {}
+
+
+def ffmpeg_filter_has_option(name: str, option: str) -> bool:
+    """Whether this FFmpeg's filter supports an option (options get added between versions)."""
+    if name not in _FILTER_OPTIONS:
+        try:
+            out = run(["ffmpeg", "-hide_banner", "-h", f"filter={name}"])
+        except (RuntimeError, OSError):
+            out = ""
+        _FILTER_OPTIONS[name] = {line.split()[0] for line in out.splitlines() if line.startswith("   ") and line.split()}
+    return option in _FILTER_OPTIONS[name]
+
+
 def slugify(text: str, maxlen: int = 60) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return s[:maxlen].rstrip("-") or "untitled"
@@ -127,7 +184,11 @@ def load_json(path: Path):
 
 
 def save_json(path: Path, data) -> None:
-    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Write via a temporary file so a reader (or a crash) never sees half a file."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
 
 
 def make_session() -> requests.Session:
@@ -160,7 +221,7 @@ def download(url: str, dest: Path) -> None:
 # ----------------------------------------------------------------------------
 class Visual(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: Literal["nasa", "pexels_video", "pexels_photo"] = Field(
+    source: Literal["nasa", "stock_video", "stock_photo"] = Field(
         description="Where to look for this scene's visual")
     query: str = Field(description="2-5 concrete, searchable words describing what is visible, "
                                    "e.g. 'Jupiter Great Red Spot' or 'aurora night sky'. Never abstract ideas.")
@@ -306,8 +367,8 @@ Target length: about {words} words of narration (roughly {minutes:g} minutes).
 
 Split the narration into scenes of 1-3 sentences each (about 15-45 words). For every scene choose ONE visual source:
 - "nasa": NASA image library. Best for planets, moons, the Sun, stars, galaxies, nebulae, spacecraft, rockets, astronauts and Earth seen from orbit.
-- "pexels_video": stock video. Best for things on Earth: oceans, volcanoes, storms, lightning, forests, glaciers, deserts, night skies, laboratories.
-- "pexels_photo": stock photo, when a still image of an Earth subject fits better.
+- "stock_video": stock footage. Best for things on Earth: oceans, volcanoes, storms, lightning, forests, glaciers, deserts, night skies, laboratories.
+- "stock_photo": stock photo, when a still image of an Earth subject fits better.
 The query must be 2-5 concrete, searchable words describing what is visible (e.g. "Jupiter Great Red Spot", "lava flow ocean", "aurora night sky"). Never abstract ideas.
 
 Also give a YouTube title (max 90 characters, curiosity-driven but accurate), a description of 2-3 short paragraphs, 10 to 15 short tags, and 2-5 punchy words of thumbnail text.{avoid}"""
@@ -392,7 +453,9 @@ def tts(text: str, mp3: Path, align_path: Path, prev_text: str = "", next_text: 
     body = {
         "text": text,
         "model_id": ELEVENLABS_MODEL,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        "voice_settings": {"stability": VOICE_STABILITY, "similarity_boost": VOICE_SIMILARITY,
+                           "style": VOICE_STYLE, "use_speaker_boost": VOICE_SPEAKER_BOOST,
+                           "speed": VOICE_SPEED},
     }
     # Neighbouring text helps the voice keep a natural flow between separate clips.
     if prev_text:
@@ -419,16 +482,28 @@ def tts(text: str, mp3: Path, align_path: Path, prev_text: str = "", next_text: 
                                "end": align["character_end_times_seconds"]})
 
 
+def audio_files(project: Path, i: int) -> dict:
+    return {ext: project / "audio" / f"scene_{i:02d}.{ext}" for ext in ("mp3", "wav", "txt", "json")}
+
+
+def voiceover_todo(project: Path, script: dict) -> list[int]:
+    """Scenes whose narration has no clip yet or was edited since its clip was made."""
+    todo = []
+    for i, scene in enumerate(script["scenes"]):
+        f = audio_files(project, i)
+        if (not f["mp3"].exists() or not f["txt"].exists()
+                or f["txt"].read_text(encoding="utf-8") != scene["narration"].strip()):
+            todo.append(i)
+    return todo
+
+
 def make_voiceover(project: Path, script: dict) -> list[dict]:
     audio_dir = project / "audio"
     audio_dir.mkdir(exist_ok=True)
     scenes = script["scenes"]
-    files = [{ext: audio_dir / f"scene_{i:02d}.{ext}" for ext in ("mp3", "wav", "txt", "json")}
-             for i in range(len(scenes))]
+    files = [audio_files(project, i) for i in range(len(scenes))]
     # Regenerate a clip only if the narration was edited since the last run.
-    todo = [i for i, f in enumerate(files)
-            if not f["mp3"].exists() or not f["txt"].exists()
-            or f["txt"].read_text(encoding="utf-8") != scenes[i]["narration"].strip()]
+    todo = voiceover_todo(project, script)
     if todo:
         chars = sum(len(scenes[i]["narration"].strip()) for i in todo)
         log(f"Voiceover: {len(todo)} scene(s) to synthesize, {chars} characters")
@@ -454,8 +529,18 @@ def make_voiceover(project: Path, script: dict) -> list[dict]:
     return timeline
 
 
+def estimated_timeline(script: dict) -> list[dict]:
+    """Scene lengths guessed from word counts, for picking visuals before the voiceover exists."""
+    out = []
+    for scene in script["scenes"]:
+        speech = len(scene["narration"].split()) * 60 / WORDS_PER_MINUTE
+        frames = round((speech + SCENE_PAD) * FPS)
+        out.append({"speech": speech, "duration": frames / FPS, "frames": frames})
+    return out
+
+
 # ----------------------------------------------------------------------------
-# Step 3: visuals (NASA Image and Video Library + Pexels)
+# Step 3: visuals (NASA Image and Video Library + stock footage from Pexels and/or Pixabay)
 # ----------------------------------------------------------------------------
 def nasa_search(query: str, used: set, min_seconds: float = 0):
     r = HTTP.get("https://images-api.nasa.gov/search",
@@ -523,13 +608,88 @@ def pexels_photo_search(query: str, used: set, min_seconds: float = 0):
     return None
 
 
-SEARCHERS = {"nasa": nasa_search, "pexels_video": pexels_video_search, "pexels_photo": pexels_photo_search}
+def pixabay_video_search(query: str, used: set, min_seconds: float = 0):
+    if not PIXABAY_API_KEY:
+        return None
+    r = HTTP.get("https://pixabay.com/api/videos/",
+                 params={"key": PIXABAY_API_KEY, "q": query[:100], "video_type": "film",
+                         "safesearch": "true", "min_width": 1280, "per_page": 15},
+                 timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    videos = [v for v in r.json().get("hits", []) if f"pixabay-video:{v['id']}" not in used]
+    videos.sort(key=lambda v: (v.get("duration") or 0) < min_seconds)  # long-enough clips first
+    for v in videos:
+        files = [f for f in (v.get("videos") or {}).values()
+                 if f.get("url") and (f.get("width") or 0) >= 1280
+                 and (f.get("width") or 0) > (f.get("height") or 0)]
+        if not files:
+            continue
+        best = min(files, key=lambda f: abs(f["width"] - W))
+        return {"kind": "video", "url": best["url"], "id": f"pixabay-video:{v['id']}",
+                "credit": f"Video by {v.get('user', 'a Pixabay contributor')} on Pixabay"}
+    return None
+
+
+def pixabay_photo_search(query: str, used: set, min_seconds: float = 0):
+    """Standard Pixabay keys get images up to 1280 px wide, so these are upscaled to 1080p."""
+    if not PIXABAY_API_KEY:
+        return None
+    r = HTTP.get("https://pixabay.com/api/",
+                 params={"key": PIXABAY_API_KEY, "q": query[:100], "image_type": "photo",
+                         "orientation": "horizontal", "safesearch": "true", "min_width": 1280,
+                         "per_page": 15},
+                 timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    for p in r.json().get("hits", []):
+        asset_id = f"pixabay-photo:{p['id']}"
+        if asset_id in used or not p.get("largeImageURL"):
+            continue
+        return {"kind": "image", "url": p["largeImageURL"], "id": asset_id,
+                "credit": f"Photo by {p.get('user', 'a Pixabay contributor')} on Pixabay"}
+    return None
+
+
+# Stock providers in order of preference; each one is skipped when its key is not set.
+STOCK_VIDEO_PROVIDERS = [("pexels", pexels_video_search), ("pixabay", pixabay_video_search)]
+STOCK_PHOTO_PROVIDERS = [("pexels", pexels_photo_search), ("pixabay", pixabay_photo_search)]
+
+
+def _stock_search(providers, query: str, used: set, min_seconds: float):
+    """Try each stock provider in turn, so one provider failing never hides the others."""
+    for name, search in providers:
+        try:
+            result = search(query, used, min_seconds)
+        except requests.RequestException as e:
+            log(f"  {name} search failed for '{query}': {e}")
+            continue
+        if result:
+            return result
+    return None
+
+
+def stock_video_search(query: str, used: set, min_seconds: float = 0):
+    return _stock_search(STOCK_VIDEO_PROVIDERS, query, used, min_seconds)
+
+
+def stock_photo_search(query: str, used: set, min_seconds: float = 0):
+    return _stock_search(STOCK_PHOTO_PROVIDERS, query, used, min_seconds)
+
+
+def stock_providers() -> list[str]:
+    """Names of the stock-footage providers that have an API key configured."""
+    return [name for name, key in (("Pexels", PEXELS_API_KEY), ("Pixabay", PIXABAY_API_KEY)) if key]
+
+
+SEARCHERS = {"nasa": nasa_search, "stock_video": stock_video_search, "stock_photo": stock_photo_search}
+# Source names used by older script.json files
+SOURCE_ALIASES = {"pexels_video": "stock_video", "pexels_photo": "stock_photo",
+                  "pixabay_video": "stock_video", "pixabay_photo": "stock_photo"}
 FALLBACK_QUERIES = ["earth from space", "milky way", "planet earth", "stars night sky"]
 
 
 def find_visual(scene: dict, used: set, min_seconds: float) -> dict:
     visual = scene.get("visual") or {}
-    preferred = visual.get("source")
+    preferred = SOURCE_ALIASES.get(visual.get("source"), visual.get("source"))
     if preferred not in SEARCHERS:   # script.json may have been edited by hand
         if preferred:
             log(f"  Unknown visual source '{preferred}', trying nasa first")
@@ -553,29 +713,92 @@ def find_visual(scene: dict, used: set, min_seconds: float) -> dict:
     raise RuntimeError(f"No visual found for scene: {query}")
 
 
+def load_manifest(project: Path) -> list:
+    """assets.json, with each file path re-anchored to this project folder (so a moved project still works)."""
+    path = project / "assets.json"
+    manifest = load_json(path) if path.exists() else []
+    for asset in manifest:
+        if asset and asset.get("path"):
+            asset["path"] = str(project / "assets" / Path(asset["path"]).name)
+    return manifest
+
+
+def rejected_assets(project: Path) -> set:
+    path = project / "rejected_assets.json"
+    return set(load_json(path)) if path.exists() else set()
+
+
+def reject_asset(project: Path, asset_id: str) -> None:
+    """Remember a visual you swapped out so 'find another' never offers it again."""
+    ids = rejected_assets(project) | {asset_id}
+    save_json(project / "rejected_assets.json", sorted(ids))
+
+
 def gather_visuals(project: Path, script: dict, timeline: list[dict]) -> list[dict]:
-    asset_dir = project / "assets"
-    asset_dir.mkdir(exist_ok=True)
-    manifest_path = project / "assets.json"
-    manifest = load_json(manifest_path) if manifest_path.exists() else []
-    used = {a["id"] for a in manifest if a}
+    manifest = load_manifest(project)
+    used = {a["id"] for a in manifest if a} | rejected_assets(project)
     for i, scene in enumerate(script["scenes"]):
         if i < len(manifest) and manifest[i] and Path(manifest[i]["path"]).exists():
             continue
         log(f"Visual {i + 1}/{len(script['scenes'])}: {scene.get('visual', {}).get('query')}")
         asset = find_visual(scene, used, timeline[i]["duration"])
-        suffix = Path(urlparse(asset["url"]).path).suffix.lower()
-        if suffix not in (".jpg", ".jpeg", ".png", ".mp4", ".webp"):
-            suffix = ".mp4" if asset["kind"] == "video" else ".jpg"
-        dest = asset_dir / f"scene_{i:02d}{suffix}"
-        download(asset["url"], dest)
-        asset["path"] = str(dest)
+        store_asset(project, manifest, i, asset, download_from=asset["url"])
         used.add(asset["id"])
-        while len(manifest) <= i:
-            manifest.append(None)
-        manifest[i] = asset
-        save_json(manifest_path, manifest)  # save after each so a crash loses nothing
     return manifest[:len(script["scenes"])]
+
+
+def store_asset(project: Path, manifest: list, i: int, asset: dict, download_from: str | None = None,
+                copy_from: Path | None = None) -> None:
+    """Save a scene's visual as assets/scene_XX.<ext> and record it in assets.json."""
+    asset_dir = project / "assets"
+    asset_dir.mkdir(exist_ok=True)
+    source = download_from or str(copy_from)
+    suffix = Path(urlparse(source).path if download_from else source).suffix.lower()
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv"):
+        suffix = ".mp4" if asset["kind"] == "video" else ".jpg"
+    dest = asset_dir / f"scene_{i:02d}{suffix}"
+    if download_from:
+        download(download_from, dest)
+    else:
+        shutil.copyfile(copy_from, dest)
+    for old in asset_dir.glob(f"scene_{i:02d}.*"):   # a swapped visual may have had another file type
+        if old != dest and not old.name.endswith(".part"):
+            old.unlink()
+    asset["path"] = str(dest)
+    while len(manifest) <= i:
+        manifest.append(None)
+    manifest[i] = asset
+    save_json(project / "assets.json", manifest)   # saved after each scene so a crash loses nothing
+
+
+def refetch_visual(project: Path, script: dict, timeline: list[dict], i: int) -> dict:
+    """Replace one scene's visual with the next-best search result, never offering a swapped-out one again."""
+    manifest = load_manifest(project)
+    old = manifest[i] if i < len(manifest) else None
+    used = {a["id"] for a in manifest if a} | rejected_assets(project)
+    log(f"Searching for another visual for scene {i + 1}: {script['scenes'][i]['visual']['query']}")
+    asset = find_visual(script["scenes"][i], used, timeline[i]["duration"])
+    store_asset(project, manifest, i, asset, download_from=asset["url"])
+    if old:
+        reject_asset(project, old["id"])
+    log(f"Scene {i + 1} now uses: {asset['credit']}")
+    return asset
+
+
+def set_custom_visual(project: Path, i: int, path: Path, credit: str = "") -> dict:
+    """Use your own image or video for a scene."""
+    kind = "video" if path.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") else "image"
+    if kind == "image":
+        from PIL import Image
+        with Image.open(path) as img:   # fail early on a broken or unsupported file
+            img.verify()
+    else:
+        media_duration(path)
+    manifest = load_manifest(project)
+    asset = {"kind": kind, "url": "", "id": f"custom:{path.name}", "credit": credit,
+             "query": "", "source": "custom"}
+    store_asset(project, manifest, i, asset, copy_from=path)
+    return asset
 
 
 # ----------------------------------------------------------------------------
@@ -641,7 +864,8 @@ def join_segments(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> No
     run(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(chain), "-map", "[v]", *ENCODE, out])
 
 
-def assemble(project: Path, timeline: list[dict], assets: list[dict]) -> Path:
+def render_segments(project: Path, timeline: list[dict], assets: list[dict]) -> int:
+    """Render each scene that is missing, has the wrong length, or whose visual was swapped. Returns xfade frames."""
     seg_dir = project / "segments"
     seg_dir.mkdir(exist_ok=True)
     n = len(assets)
@@ -650,38 +874,143 @@ def assemble(project: Path, timeline: list[dict], assets: list[dict]) -> Path:
         out = seg_dir / f"seg_{i:02d}.mp4"
         want = tl["frames"] + (xf if i < n - 1 else 0)
         have = segment_frames(out)
-        if have == want:
+        swapped = have is not None and Path(asset["path"]).stat().st_mtime > out.stat().st_mtime
+        if have == want and not swapped:
             continue
-        if have is not None:
+        if swapped:
+            log(f"Scene {i + 1} has a new visual, re-rendering")
+        elif have is not None:
             log(f"Scene {i + 1} changed length ({have} -> {want} frames), re-rendering")
         else:
             log(f"Rendering scene {i + 1}/{n} ({asset['kind']}, {tl['duration']:.1f}s)")
         render_scene(asset, want, out, i)
+    for extra in seg_dir.glob("seg_*.mp4"):   # left over from scenes that were deleted
+        m = re.fullmatch(r"seg_(\d+)\.mp4", extra.name)
+        if m and int(m.group(1)) >= n:
+            extra.unlink()
+    return xf
 
-    video_only = project / "video_only.mp4"
-    join_segments(seg_dir, timeline, xf, video_only)
 
-    # Concatenate narration
+def join_needed(project: Path, timeline: list[dict], video_only: Path) -> bool:
+    """Joining re-encodes the whole video, so skip it when no segment changed since the last join."""
+    if not video_only.exists() or video_frames(video_only) != sum(t["frames"] for t in timeline):
+        return True
+    joined = video_only.stat().st_mtime
+    return any((project / "segments" / f"seg_{i:02d}.mp4").stat().st_mtime > joined for i in range(len(timeline)))
+
+
+def concat_narration(project: Path, n: int, out: Path, name: str = "list.txt") -> Path:
     audio_dir = project / "audio"
-    (audio_dir / "list.txt").write_text(
-        "".join(f"file 'scene_{i:02d}.wav'\n" for i in range(n)), encoding="utf-8")
-    narration = project / "narration.wav"
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", audio_dir / "list.txt", "-c", "copy", narration])
+    (audio_dir / name).write_text("".join(f"file 'scene_{i:02d}.wav'\n" for i in range(n)), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", audio_dir / name, "-c", "copy", out])
+    return out
 
-    # Final mix: narration (+ optional music bed), loudness-normalised for YouTube
-    final = project / "final.mp4"
-    inputs = ["-i", video_only, "-i", narration]
-    loudnorm = "loudnorm=I=-14:TP=-1.5:LRA=11"
-    if MUSIC_PATH and MUSIC_PATH.exists():
-        inputs += ["-stream_loop", "-1", "-i", MUSIC_PATH]
-        fc = (f"[2:a]volume={MUSIC_VOLUME}[m];"
-              f"[1:a][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,{loudnorm}[a]")
+
+_LOUDNESS: dict = {}
+
+
+def integrated_loudness(path: Path) -> float | None:
+    """Integrated loudness of an audio file in LUFS (None if silent or unreadable), measured once per file version."""
+    st = path.stat()
+    key = (str(path), st.st_size, st.st_mtime)
+    if key not in _LOUDNESS:
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-vn",
+                                 "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+                                capture_output=True, text=True)
+        err = result.stderr
+        try:
+            value = float(json.loads(err[err.rindex("{"):err.rindex("}") + 1])["input_i"])
+        except (ValueError, KeyError):
+            value = None
+        _LOUDNESS[key] = value if value is not None and value > -70 else None
+    return _LOUDNESS[key]
+
+
+def voice_filters(tone: str | None = None) -> list[str]:
+    chain = VOICE_TONES.get(tone or VOICE_TONE, VOICE_TONES["soft"])
+    return [f for f in chain if ffmpeg_has_filter(f.split("=", 1)[0])]
+
+
+def music_gain_db() -> float | None:
+    """Gain that puts the music MUSIC_VOLUME below the narration, whatever loudness the track was mastered at."""
+    if not (MUSIC_PATH and MUSIC_PATH.is_file()):
+        return None
+    lufs = integrated_loudness(MUSIC_PATH)
+    if lufs is None:
+        log(f"Note: {MUSIC_PATH.name} seems silent or unreadable, so the music is left out")
+        return None
+    return VOICE_LUFS + 20 * math.log10(MUSIC_VOLUME) - lufs
+
+
+def audio_filter(voice_in: str, music_in: str | None, gain_db: float | None, tone: str | None = None) -> str:
+    """Filter graph: narration (tone-shaped, normalised to VOICE_LUFS) + optional music bed, output label [a]."""
+    fmt = "aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    voice = ",".join([*voice_filters(tone), f"loudnorm=I={VOICE_LUFS:g}:TP=-1.5:LRA=11", fmt])
+    if music_in is None or gain_db is None:
+        return f"[{voice_in}]{voice}[a]"
+    music = f"[{music_in}]{fmt},volume={gain_db:.2f}dB"
+    duck = MUSIC_DUCKING and ffmpeg_has_filter("sidechaincompress")
+    if duck:   # the music dips by about 6 dB while the narrator speaks and comes back up in pauses
+        graph = [f"[{voice_in}]{voice},asplit=2[v][sc]", f"{music}[m0]",
+                 "[m0][sc]sidechaincompress=threshold=0.05:ratio=3:attack=50:release=600[m]"]
     else:
-        fc = f"[1:a]{loudnorm}[a]"
-    log("Mixing final video")
+        graph = [f"[{voice_in}]{voice}[v]", f"{music}[m]"]
+    limiter = "alimiter=limit=0.89" + (":level=false" if ffmpeg_filter_has_option("alimiter", "level") else "")
+    graph.append(f"[v][m]amix=inputs=2:duration=first:dropout_transition=0,volume=2,{limiter}[a]")
+    return ";".join(graph)
+
+
+def describe_music() -> str:
+    if not (MUSIC_PATH and MUSIC_PATH.is_file()):
+        return "no music"
+    duck = ", ducked under speech" if MUSIC_DUCKING else ""
+    return f"music {MUSIC_PATH.name} {-20 * math.log10(MUSIC_VOLUME):.0f} dB below the voice{duck}"
+
+
+def mix_final(video_only: Path, narration: Path, final: Path) -> None:
+    gain = music_gain_db()
+    inputs = ["-i", video_only, "-i", narration]
+    if gain is not None:
+        inputs += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+    fc = audio_filter("1:a", "2:a" if gain is not None else None, gain)
+    log(f"Mixing final video (voice tone: {VOICE_TONE}, {describe_music()})")
     run(["ffmpeg", "-y", *inputs, "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
          "-movflags", "+faststart", "-shortest", final])
+
+
+def preview_mix(project: Path, out: Path, seconds: float = 45, tone: str | None = None,
+                music: bool = True) -> Path:
+    """A short MP3 of the narration with the current tone and music settings, for tuning the sound quickly."""
+    wavs = []
+    for i in range(10_000):
+        if not audio_files(project, i)["wav"].exists():
+            break
+        wavs.append(i)
+    if not wavs:
+        raise RuntimeError("This project has no voiceover yet, so there is nothing to preview")
+    narration = concat_narration(project, len(wavs), project / "audio" / "preview_narration.wav", "preview_list.txt")
+    gain = music_gain_db() if music else None
+    inputs = ["-i", narration]
+    if gain is not None:
+        inputs += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+    fc = audio_filter("0:a", "1:a" if gain is not None else None, gain, tone)
+    run(["ffmpeg", "-y", *inputs, "-filter_complex", fc, "-map", "[a]", "-t", f"{seconds:g}",
+         "-c:a", "libmp3lame", "-b:a", "192k", out])
+    narration.unlink(missing_ok=True)
+    return out
+
+
+def assemble(project: Path, timeline: list[dict], assets: list[dict]) -> Path:
+    n = len(assets)
+    xf = render_segments(project, timeline, assets)
+    video_only = project / "video_only.mp4"
+    if join_needed(project, timeline, video_only):
+        join_segments(project / "segments", timeline, xf, video_only)
+    narration = concat_narration(project, n, project / "narration.wav")
+    # Final mix: narration (+ optional music bed), loudness-normalised for YouTube
+    final = project / "final.mp4"
+    mix_final(video_only, narration, final)
     log(f"Video ready: {final} ({media_duration(final) / 60:.1f} min)")
     return final
 
@@ -780,7 +1109,9 @@ def load_font(size: int):
 
 def make_thumbnail(project: Path, script: dict, timeline: list[dict], assets: list[dict]) -> Path:
     from PIL import Image, ImageDraw
-    idx = next((i for i, a in enumerate(assets) if a["kind"] == "image"), 0)
+    idx = script.get("thumbnail_scene")   # chosen in the web UI; otherwise the first still image
+    if not isinstance(idx, int) or not 0 <= idx < len(assets):
+        idx = next((i for i, a in enumerate(assets) if a["kind"] == "image"), 0)
     frame = project / "thumb_frame.jpg"
     run(["ffmpeg", "-y", "-ss", f"{timeline[idx]['duration'] / 2:.2f}",
          "-i", project / "segments" / f"seg_{idx:02d}.mp4", "-frames:v", "1", "-q:v", "2", frame])
@@ -832,8 +1163,8 @@ def youtube_credentials(interactive: bool):
             creds = None
     if not creds or not creds.valid:
         if not interactive:
-            raise RuntimeError("YouTube login is missing or expired. Run the pipeline once without --yes "
-                               "to sign in again (see 'Login expiry' in the README).")
+            raise RuntimeError("YouTube login is missing or expired. Sign in again with: python pipeline.py --login "
+                               "(see 'Login expiry' in the README).")
         if not YT_CLIENT_SECRETS.exists():
             raise RuntimeError(f"{YT_CLIENT_SECRETS} not found (needed to sign in to YouTube)")
         from google_auth_oauthlib.flow import InstalledAppFlow
@@ -853,9 +1184,10 @@ def clean_text(s: str) -> str:
 
 
 def build_description(script: dict, assets: list[dict]) -> str:
-    credits = list(dict.fromkeys(a["credit"] for a in assets if a))
+    credits = list(dict.fromkeys(a["credit"] for a in assets if a and a.get("credit")))
     desc = clean_text(script.get("description", "")).strip()
-    desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
+    if credits:
+        desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
     desc += "\n\nNarration uses an AI-generated voice. Script researched and reviewed by the channel."
     return desc[:4900]
 
@@ -923,6 +1255,27 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
 # ----------------------------------------------------------------------------
 # Orchestration
 # ----------------------------------------------------------------------------
+def settings_problems() -> list[str]:
+    """Sound and voice settings that are out of range (shared by the CLI preflight and the web UI)."""
+    problems = []
+    if MUSIC_PATH and not MUSIC_PATH.is_file():
+        problems.append(f"MUSIC_PATH points to {MUSIC_PATH}, which does not exist "
+                        "(fix the path, or leave MUSIC_PATH empty for narration only)")
+    if not 0 < MUSIC_VOLUME <= 0.5:
+        problems.append(f"MUSIC_VOLUME is {MUSIC_VOLUME:g}; use a value above 0 and up to 0.5, e.g. 0.10")
+    if VOICE_TONE not in VOICE_TONES:
+        problems.append(f"VOICE_TONE is '{VOICE_TONE}'; use one of: {', '.join(VOICE_TONES)}")
+    for name, value in (("VOICE_STABILITY", VOICE_STABILITY), ("VOICE_SIMILARITY", VOICE_SIMILARITY),
+                        ("VOICE_STYLE", VOICE_STYLE)):
+        if not 0 <= value <= 1:
+            problems.append(f"{name} is {value:g}; use a value from 0 to 1")
+    if not 0.7 <= VOICE_SPEED <= 1.2:
+        problems.append(f"VOICE_SPEED is {VOICE_SPEED:g}; ElevenLabs accepts 0.7 to 1.2")
+    if CROSSFADE < 0 or CROSSFADE > 2:
+        problems.append(f"CROSSFADE is {CROSSFADE:g}; use 0 (hard cuts) up to 2 seconds")
+    return problems
+
+
 def preflight(upload_enabled: bool, unattended: bool) -> None:
     problems = []
     for tool in ("ffmpeg", "ffprobe"):
@@ -931,8 +1284,14 @@ def preflight(upload_enabled: bool, unattended: bool) -> None:
     for name in ("ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"):
         if not os.getenv(name):
             problems.append(f"{name} is missing from .env")
-    if not PEXELS_API_KEY:
-        log("Note: PEXELS_API_KEY not set, so only NASA images will be used")
+    providers = stock_providers()
+    if providers:
+        log(f"Stock footage: {' and '.join(providers)}")
+    else:
+        log("Note: neither PEXELS_API_KEY nor PIXABAY_API_KEY is set, so only NASA images will be used")
+    problems += settings_problems()
+    if not problems:
+        log(f"Sound: voice tone {VOICE_TONE}, {describe_music()}")
     if upload_enabled:
         if unattended:
             try:
@@ -1065,8 +1424,13 @@ def main() -> None:
     p.add_argument("--publish-at", help="Schedule publish time, ISO 8601 UTC, e.g. 2026-11-05T15:00:00Z")
     p.add_argument("--synthetic", action="store_true",
                    help="Tick YouTube's altered/synthetic content disclosure (use if you add realistic AI visuals)")
+    p.add_argument("--login", action="store_true", help="Sign in to YouTube in the browser, save the login, and exit")
     args = p.parse_args()
 
+    if args.login:
+        youtube_credentials(interactive=True)
+        log(f"YouTube login saved to {YT_TOKEN}")
+        return
     preflight(upload_enabled=not args.no_upload, unattended=args.yes)
 
     if args.topics_file:

@@ -5,6 +5,7 @@ youtube_token.json
 
 # Generated videos, audio, downloaded assets and queue state
 projects/
+music/
 topics_done.txt
 topics_failed.txt
 pipeline.log
@@ -12,6 +13,7 @@ pipeline.log
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
 

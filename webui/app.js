@@ -535,12 +535,94 @@ function visualCard(s, i) {
           Object.entries(SOURCES).map(([k, label]) => h("option", { value: k, selected: s.visual.source === k ? true : null }, label))),
         h("input", { class: "grow", value: s.visual.query, maxlength: 100, oninput: e => { s.visual.query = e.target.value; markDirty(); } })),
       h("div", { class: "row" },
-        h("button", { class: "small", title: "Search again with the words above and swap in the next best result",
-          onclick: () => startJob("find_visual", { scene: i }) }, a ? "Find another" : "Find visual"),
+        h("button", { class: "small primary", title: "Browse search results with previews and pick one",
+          onclick: () => openPicker(i) }, "Choose…"),
+        h("button", { class: "small", title: "Search with the words above and swap in the next result you have not skipped",
+          onclick: () => startJob("find_visual", { scene: i }) }, a ? "Next result" : "Find visual"),
         h("button", { class: "small", onclick: () => file.click() }, "Upload my own"), file,
         a ? h("button", { class: "small", disabled: isThumb, onclick: () => {
           d._thumbScene = s; markDirty(); renderProject();
         } }, "Use for thumbnail") : null)));
+}
+
+// ---------------------------------------------------------------- visual picker
+async function openPicker(i) {
+  if (S.dirty && !(await saveDraft())) return;   // scene numbers must match the saved script
+  const s = S.draft.scenes[i];
+  const slug = S.slug;
+  let page = 1, sceneSeconds = null, closed = false;
+  const q = h("input", { class: "grow", value: s.visual.query, maxlength: 100, placeholder: "Search words, e.g. molten lava" });
+  const src = h("select", {}, Object.entries(SOURCES).map(([k, label]) => h("option", { value: k, selected: s.visual.source === k ? true : null }, label)));
+  const grid = h("div", { class: "pgrid" });
+  const status = h("div", { class: "muted small" });
+  const more = h("button", { hidden: true, onclick: () => search(page + 1) }, "More results");
+  const overlay = h("div", { class: "modal-back", onclick: e => { if (e.target === overlay) close(); } });
+  const onKey = e => { if (e.key === "Escape") close(); };
+  function close() { closed = true; overlay.remove(); document.removeEventListener("keydown", onKey); }
+
+  async function search(p) {
+    status.replaceChildren(h("span", { class: "row" }, h("span", { class: "spinner" }), "Searching…"));
+    more.hidden = true;
+    try {
+      const r = await api("GET", `/api/projects/${encodeURIComponent(slug)}/scenes/${i}/candidates?` +
+        new URLSearchParams({ q: q.value, source: src.value, page: p }));
+      if (closed) return;
+      page = p; sceneSeconds = r.scene_seconds;
+      if (p === 1) grid.replaceChildren();
+      r.results.forEach(c => grid.append(card(c)));
+      const shown = grid.children.length;
+      const notes = [];
+      if (src.value !== "nasa" && !r.stock_providers.length) notes.push("No stock footage key is set, so stock searches return nothing (see the README).");
+      notes.push(...r.errors);
+      status.replaceChildren(
+        shown ? `${shown} result(s). Click one to use it for scene ${i + 1}.` : "Nothing found. Try other or fewer words.",
+        sceneSeconds ? ` The scene lasts ${Math.round(sceneSeconds)} s; shorter clips loop.` : "",
+        ...notes.map(n => h("div", { class: "warn-text" }, n)));
+      more.hidden = r.results.length === 0;
+    } catch (e) { if (!closed) status.replaceChildren(h("span", { class: "warn-text" }, e.message)); }
+  }
+
+  function card(c) {
+    const media = h("div", { class: "pmedia" }, c.thumb ? h("img", { src: c.thumb, alt: "", loading: "lazy", referrerpolicy: "no-referrer" }) : "No preview");
+    if (c.kind === "video" && c.preview) {
+      let vid = null;
+      media.addEventListener("mouseenter", () => {
+        vid = h("video", { src: c.preview, muted: true, autoplay: true, loop: true, playsinline: true });
+        vid.muted = true;
+        media.append(vid);
+      });
+      media.addEventListener("mouseleave", () => { if (vid) { vid.remove(); vid = null; } });
+    }
+    const short = c.kind === "video" && sceneSeconds && c.duration && c.duration < sceneSeconds;
+    return h("button", { class: "pcard" + (c.current ? " current" : ""), title: c.credit, onclick: () => pick(c) },
+      media,
+      h("div", { class: "pinfo" },
+        chip(c.provider),
+        c.kind === "video" ? chip(c.duration ? `${c.duration} s${short ? " · loops" : ""}` : "video", short ? "warn" : "") : chip("photo"),
+        c.current ? chip("current", "ok") : null,
+        c.used_in ? chip(`in scene ${c.used_in}`, "warn") : null,
+        c.rejected && !c.current ? chip("skipped before") : null),
+      h("div", { class: "pcredit muted small" }, c.title || c.credit));
+  }
+
+  function pick(c) {
+    if (c.current) { toast("That is already this scene's visual"); return; }
+    if (c.used_in && !confirm(`Scene ${c.used_in} already uses this. Use it for scene ${i + 1} too?`)) return;
+    close();
+    startJob("pick_visual", { scene: i, candidate: c.id, query: q.value.trim() });
+  }
+
+  overlay.append(h("div", { class: "modal panel", role: "dialog", "aria-label": `Choose a visual for scene ${i + 1}` },
+    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, `Choose a visual for scene ${i + 1}`),
+      h("button", { class: "small", onclick: close }, "Close")),
+    h("div", { class: "narr muted small" }, s.narration),
+    h("form", { class: "row", onsubmit: e => { e.preventDefault(); search(1); } },
+      src, q, h("button", { class: "primary", type: "submit" }, "Search")),
+    status, grid, h("div", { class: "row", style: "justify-content:center" }, more)));
+  document.body.append(overlay);
+  document.addEventListener("keydown", onKey);
+  q.focus();
+  search(1);
 }
 
 // ---------------------------------------------------------------- video tab

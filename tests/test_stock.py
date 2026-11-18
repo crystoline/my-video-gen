@@ -126,6 +126,74 @@ def test_old_pexels_source_names_still_work(http, monkeypatch):
     assert r["source"] == "stock_video" and r["id"] == "pixabay-video:2" and r["query"] == "ocean waves"
 
 
+def test_picker_candidates_carry_preview_images_and_clips(http, monkeypatch):
+    monkeypatch.setattr(pl, "PEXELS_API_KEY", "pex-key")
+    monkeypatch.setattr(pl, "PIXABAY_API_KEY", "pix-key")
+    http({"https://api.pexels.com/videos/search": PEXELS_VIDEOS,
+          "https://pixabay.com/api/videos/": PIXABAY_VIDEOS, "https://pixabay.com/api/": PIXABAY_PHOTOS,
+          "https://api.pexels.com/v1/search": {"photos": [{"id": 5, "photographer": "Kim", "width": 6000, "height": 4000,
+                                                          "src": {"original": "https://pexels/5.jpeg",
+                                                                  "medium": "https://pexels/5_m.jpeg"}}]}})
+    pv = pl.pexels_video_candidates("ocean")[0]
+    assert pv["thumb"] == "https://images.pexels.com/99.jpg" and pv["preview"] == "https://pexels/99_sd.mp4"
+    assert pv["url"] == "https://pexels/99_hd.mp4" and pv["duration"] == 12 and pv["source"] == "stock_video"
+    xv = pl.pixabay_video_candidates("ocean")
+    assert [c["id"] for c in xv] == ["pixabay-video:1", "pixabay-video:2"]
+    assert xv[1]["thumb"] == "https://cdn.pixabay.com/v2_1920.jpg" and xv[1]["preview"] == "https://cdn.pixabay.com/v2_960.mp4"
+    xp = pl.pixabay_photo_candidates("volcano")[0]
+    assert xp["thumb"] == "https://pixabay.com/get/7_640.jpg" and xp["url"] == "https://pixabay.com/get/7_1280.jpg"
+    pp = pl.pexels_photo_candidates("volcano")[0]
+    assert pp["thumb"] == "https://pexels/5_m.jpeg" and pp["credit"] == "Photo by Kim on Pexels"
+
+
+def test_a_pixabay_page_past_the_last_result_is_just_empty(http, monkeypatch):
+    class Past(FakeResp):
+        status_code = 400
+
+        def raise_for_status(self):
+            raise requests.HTTPError("400")
+
+    monkeypatch.setattr(pl, "PIXABAY_API_KEY", "pix-key")
+    fake = http({})
+    fake.get = lambda url, **kw: Past({})
+    assert pl.pixabay_video_candidates("ocean", page=3) == [] and pl.pixabay_photo_candidates("ocean", page=3) == []
+
+
+def test_search_candidates_interleaves_providers_and_reports_failures(monkeypatch):
+    def mk(prefix, n):
+        return lambda q, per_page, page: [{"id": f"{prefix}{k}", "kind": "video"} for k in range(n)]
+
+    monkeypatch.setattr(pl, "pexels_video_candidates", mk("p", 2))
+    monkeypatch.setattr(pl, "pixabay_video_candidates", mk("x", 3))
+    results, errors = pl.search_candidates("stock_video", "ocean")
+    assert [c["id"] for c in results] == ["p0", "x0", "p1", "x1", "x2"] and errors == []
+
+    def down(q, per_page, page):
+        raise requests.ConnectionError("pixabay down")
+
+    monkeypatch.setattr(pl, "pixabay_video_candidates", down)
+    results, errors = pl.search_candidates("stock_video", "ocean")
+    assert [c["id"] for c in results] == ["p0", "p1"] and len(errors) == 1 and "Pixabay" in errors[0]
+
+
+def test_nasa_candidates_show_a_preview_and_look_up_the_large_image_when_used(http):
+    http({"https://images-api.nasa.gov/search": {"collection": {"items": [
+        {"href": "http://images-assets.nasa.gov/image/PIA1/collection.json",
+         "data": [{"nasa_id": "PIA1", "title": "Mars", "center": "JPL"}],
+         "links": [{"href": "http://images-assets.nasa.gov/image/PIA1/PIA1~thumb.jpg", "rel": "preview", "render": "image"}]},
+        {"data": [{"title": "no id"}]}]}},
+        "https://images-assets.nasa.gov/image/PIA1/collection.json": [
+            "http://images-assets.nasa.gov/image/PIA1/PIA1~small.jpg",
+            "http://images-assets.nasa.gov/image/PIA1/PIA1~large.jpg"]})
+    [c] = pl.nasa_candidates("mars")
+    assert c["id"] == "nasa:PIA1" and c["url"] is None and c["thumb"].startswith("https://") and c["source"] == "nasa"
+    assert pl.nasa_image_url(c["collection"]) == "https://images-assets.nasa.gov/image/PIA1/PIA1~large.jpg"
+    r = pl.nasa_search("mars", set())
+    assert r == {"kind": "image", "url": "https://images-assets.nasa.gov/image/PIA1/PIA1~large.jpg", "id": "nasa:PIA1",
+                 "credit": "Mars (JPL; NASA image PIA1)"}
+    assert pl.nasa_search("mars", {"nasa:PIA1"}) is None
+
+
 def test_without_stock_keys_scenes_fall_back_to_nasa(http, monkeypatch):
     fake = http({})
     nasa = lambda q, used, min_seconds=0: {"kind": "image", "url": "https://nasa/x.jpg", "id": "nasa:x", "credit": "NASA"}

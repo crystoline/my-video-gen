@@ -104,6 +104,57 @@ def test_find_another_skips_swapped_out_visuals_and_own_uploads_are_checked(clie
     assert r.status_code == 400
 
 
+def test_the_visual_picker_shows_results_and_uses_only_what_the_server_found(client, fakes, monkeypatch):
+    slug, P = new_project(client)
+    run_job(client, slug, action="visuals")
+    ids = [a["id"] for a in pl.load_json(P / "assets.json")]
+    searches = []
+
+    def fake_search(source, query, page=1):
+        searches.append((source, query, page))
+        return [{"kind": "video", "url": "https://cdn.example/clip.mp4", "id": "pixabay-video:42", "credit": "Video by Ann",
+                 "thumb": "https://cdn.example/clip.jpg", "preview": "https://cdn.example/tiny.mp4", "duration": 3,
+                 "provider": "Pixabay", "source": "stock_video"},
+                {"kind": "image", "url": "https://cdn.example/a.jpg", "id": ids[0], "credit": "Already in scene 1",
+                 "provider": "Pexels", "source": "stock_photo"},
+                {"kind": "image", "url": "https://cdn.example/b.jpg", "id": ids[1], "credit": "Current one",
+                 "provider": "Pexels", "source": "stock_photo"}], ["Pexels search failed: timeout"]
+
+    monkeypatch.setattr(pl, "search_candidates", fake_search)
+    r = client.get(f"/api/projects/{slug}/scenes/1/candidates?q=molten%20lava&source=stock_video&page=2")
+    assert r.status_code == 200, r.get_json()
+    data = r.get_json()
+    assert searches[-1] == ("stock_video", "molten lava", 2) and data["errors"] == ["Pexels search failed: timeout"]
+    first, other, current = data["results"]
+    assert "url" not in first and first["preview"] == "https://cdn.example/tiny.mp4" and not first["current"]
+    assert other["used_in"] == 1 and not other["current"] and current["current"] and current["used_in"] is None
+    assert data["scene_seconds"] > 0
+    assert client.get(f"/api/projects/{slug}/scenes/1/candidates?source=bogus").status_code == 400
+    assert client.get(f"/api/projects/{slug}/scenes/9/candidates").status_code == 404
+
+    # A pick must name a result the server found; a URL from the browser is never used
+    url = f"/api/projects/{slug}/jobs"
+    assert client.post(url, json={"action": "pick_visual", "scene": 1, "candidate": "pixabay-video:999"},
+                       headers=H).status_code == 400
+    downloaded = []
+    monkeypatch.setattr(pl, "download", lambda u, dest: downloaded.append(u) or dest.write_bytes(b"clip"))
+    run_job(client, slug, action="pick_visual", scene=1, candidate="pixabay-video:42", query="molten lava",
+            url="https://evil.example/x.mp4")
+    assert downloaded == ["https://cdn.example/clip.mp4"]
+    m = pl.load_json(P / "assets.json")
+    assert m[1]["id"] == "pixabay-video:42" and m[1]["kind"] == "video" and m[1]["source"] == "stock_video"
+    assert (P / "assets" / "scene_01.mp4").exists() and not list((P / "assets").glob("scene_01.png"))
+    assert ids[1] in pl.load_json(P / "rejected_assets.json")
+    assert pl.load_json(P / "script.json")["scenes"][1]["visual"] == {"source": "stock_video", "query": "molten lava"}
+
+    # Picking a result you skipped before un-skips it
+    client.get(f"/api/projects/{slug}/scenes/1/candidates?q=x&source=stock_photo")
+    run_job(client, slug, action="pick_visual", scene=1, candidate=ids[1], query="")
+    assert pl.load_json(P / "assets.json")[1]["id"] == ids[1]
+    assert ids[1] not in pl.load_json(P / "rejected_assets.json")
+    assert "pixabay-video:42" in pl.load_json(P / "rejected_assets.json")
+
+
 def test_project_files_stream_with_ranges_and_cannot_escape_the_folder(client, fakes):
     slug, P = new_project(client)
     (P / "assets").mkdir()

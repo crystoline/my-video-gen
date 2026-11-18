@@ -90,7 +90,7 @@ Then open http://localhost:8765. From WSL, open it in your normal Windows browse
 
 - **Videos:** start a video from a topic, and see where every video stands.
 - **Script:** edit the title, description, tags and each scene's narration and visual search. Apply the fact-checker's fixes with one click, and move, add or delete scenes. Narration clips and visuals follow their scene when you reorder, so nothing is narrated twice. Each scene shows whether its narration clip is current or will be regenerated, with its character count.
-- **Visuals:** see every scene's image or clip. Swap a visual for the next search result, search with new words, or upload your own image or video. Pick the thumbnail background.
+- **Visuals:** see every scene's image or clip. **Choose…** opens a grid of search results from Pexels, Pixabay or NASA with preview images (video clips play when you hover), so you can compare a dozen options, change the search words, and pick one. Only the one you pick is downloaded. **Next result** swaps in the next search result without looking, and you can upload your own image or video. Pick the thumbnail background here too.
 - **Video:** render, watch, preview the sound, update the thumbnail, and upload to YouTube with privacy and schedule options.
 - **Topic queue:** reorder `topics.txt`, start a video from any topic, and send failed topics back to the queue.
 - **Settings:** music file, music level, ducking, voice tone and ElevenLabs voice settings, with a 45-second preview mixed from a real video. Settings are saved to `.env`, so the command line uses them too.

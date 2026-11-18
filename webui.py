@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -467,6 +468,17 @@ def job_find_visual(slug: str, scene: int) -> None:
     pl.refetch_visual(p, script, timeline_for(p, script), scene)
 
 
+def job_pick_visual(slug: str, scene: int, candidate: dict, query: str) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    pl.use_visual(p, scene, dict(candidate, query=query))
+    # Remember the search that found it, so "Next result" continues from there
+    visual = script["scenes"][scene].setdefault("visual", {})
+    if query and (visual.get("query") != query or visual.get("source") != candidate["source"]):
+        visual.update(source=candidate["source"], query=query)
+        pl.save_json(p / "script.json", script)
+
+
 def job_render(slug: str) -> None:
     p = pl.PROJECTS_DIR / slug
     script = need_script(p)
@@ -658,6 +670,14 @@ def api_start_job(slug):
     elif action == "find_visual":
         i = scene_index()
         job = enqueue(slug, action, f"Find another visual for scene {i + 1}", job_find_visual, slug=slug, scene=i)
+    elif action == "pick_visual":
+        i = scene_index()
+        candidate = CANDIDATES.get(str(data.get("candidate", "")))
+        if not candidate:   # only results this server found are used, never a URL sent by the browser
+            raise ValueError("That search result has expired (the web UI may have restarted). Search again.")
+        query = " ".join(str(data.get("query") or "").split())[:100]
+        job = enqueue(slug, action, f"Use the picked visual for scene {i + 1}", job_pick_visual, slug=slug, scene=i,
+                      candidate=dict(candidate), query=query)
     elif action == "preview":
         seconds = float(data.get("seconds") or 45)
         job = enqueue(slug, action, "Preview the sound", job_preview, slug=slug, seconds=min(max(seconds, 5), 300))
@@ -679,6 +699,51 @@ def api_start_job(slug):
     else:
         raise ValueError(f"Unknown action: {action}")
     return jsonify(job.to_dict())
+
+
+CANDIDATES: "OrderedDict[str, dict]" = OrderedDict()   # search results by id, with their download URLs
+_candidates_lock = threading.Lock()
+PUBLIC_FIELDS = ("id", "kind", "provider", "source", "thumb", "preview", "credit", "duration", "width", "height", "title")
+
+
+@app.get("/api/projects/<slug>/scenes/<int:scene>/candidates")
+def api_candidates(slug, scene):
+    """Search results for one scene's visual picker. Nothing is downloaded until one is picked."""
+    p = project_dir(slug)
+    script = need_script(p)
+    if not 0 <= scene < len(script["scenes"]):
+        abort(404, "Unknown scene")
+    visual = script["scenes"][scene].get("visual") or {}
+    source = request.args.get("source") or pl.SOURCE_ALIASES.get(visual.get("source"), visual.get("source"))
+    if source not in SOURCES:
+        raise ValueError("Unknown source")
+    query = " ".join((request.args.get("q") or visual.get("query") or "").split())[:100]
+    if not query:
+        raise ValueError("Enter some search words")
+    try:
+        page = min(max(int(request.args.get("page", 1)), 1), 20)
+    except ValueError:
+        page = 1
+    results, errors = pl.search_candidates(source, query, page)
+    with _candidates_lock:
+        for c in results:
+            CANDIDATES[c["id"]] = c
+            CANDIDATES.move_to_end(c["id"])
+        while len(CANDIDATES) > 5000:
+            CANDIDATES.popitem(last=False)
+    used = {a["id"]: k for k, a in enumerate(pl.load_manifest(p)) if a}
+    rejected = pl.rejected_assets(p)
+    out = []
+    for c in results:
+        item = {k: c.get(k) for k in PUBLIC_FIELDS}
+        k = used.get(c["id"])
+        item.update(current=k == scene, used_in=None if k is None or k == scene else k + 1,
+                    rejected=c["id"] in rejected)
+        out.append(item)
+    timeline = timeline_for(p, script)
+    return jsonify({"query": query, "source": source, "page": page, "results": out, "errors": errors,
+                    "scene_seconds": timeline[scene]["duration"] if scene < len(timeline) else None,
+                    "stock_providers": pl.stock_providers()})
 
 
 @app.post("/api/projects/<slug>/scenes/<int:scene>/visual")

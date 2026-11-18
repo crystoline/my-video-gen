@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import itertools
 import json
 import math
 import os
@@ -28,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Literal
@@ -542,111 +544,178 @@ def estimated_timeline(script: dict) -> list[dict]:
 # ----------------------------------------------------------------------------
 # Step 3: visuals (NASA Image and Video Library + stock footage from Pexels and/or Pixabay)
 # ----------------------------------------------------------------------------
-def nasa_search(query: str, used: set, min_seconds: float = 0):
+# Each provider has a *_candidates function that lists its usable results with preview images (the web UI's
+# visual picker shows these), and a *_search function that takes the first one not used yet (automatic picks).
+ASSET_FIELDS = ("kind", "url", "id", "credit")   # what assets.json keeps of a search result
+PER_PAGE = 15
+
+
+def _https(url):
+    return url.replace("http://", "https://", 1) if isinstance(url, str) else url
+
+
+def _first_unused(candidates: list[dict], used: set, min_seconds: float = 0):
+    """The first result not used yet, preferring clips at least min_seconds long (the order is otherwise kept)."""
+    fresh = [c for c in candidates if c["id"] not in used]
+    fresh.sort(key=lambda c: c["kind"] == "video" and (c.get("duration") or 0) < min_seconds)
+    return {k: fresh[0][k] for k in ASSET_FIELDS} if fresh else None
+
+
+def nasa_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    """NASA results carry a preview image; the full-size image URL is looked up only when one is used."""
     r = HTTP.get("https://images-api.nasa.gov/search",
-                 params={"q": query, "media_type": "image"}, timeout=HTTP_TIMEOUT)
+                 params={"q": query, "media_type": "image", "page": page, "page_size": per_page},
+                 timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    for item in r.json().get("collection", {}).get("items", [])[:20]:
+    out = []
+    for item in r.json().get("collection", {}).get("items", [])[:per_page]:
         data = (item.get("data") or [{}])[0]
-        asset_id = f"nasa:{data.get('nasa_id')}"
-        if not data.get("nasa_id") or asset_id in used:
-            continue
-        try:
-            files = HTTP.get(item["href"], timeout=HTTP_TIMEOUT).json()
-        except (requests.RequestException, ValueError, KeyError):
-            continue
-        url = None
-        for suffix in ("~large.jpg", "~orig.jpg", "~medium.jpg", "~large.png", "~orig.png"):
-            url = next((u for u in files if u.lower().endswith(suffix)), None)
-            if url:
-                break
-        if not url:
+        if not data.get("nasa_id") or not item.get("href"):
             continue
         who = data.get("photographer") or data.get("secondary_creator") or data.get("center") or "NASA"
-        return {"kind": "image", "url": url.replace("http://", "https://", 1), "id": asset_id,
-                "credit": f"{data.get('title', 'NASA image')} ({who}; NASA image {data['nasa_id']})"}
+        thumb = next((link.get("href") for link in item.get("links") or [] if link.get("render") == "image"), None)
+        out.append({"kind": "image", "url": None, "collection": _https(item["href"]), "id": f"nasa:{data['nasa_id']}",
+                    "credit": f"{data.get('title', 'NASA image')} ({who}; NASA image {data['nasa_id']})",
+                    "thumb": _https(thumb), "title": data.get("title", ""), "provider": "NASA", "source": "nasa"})
+    return out
+
+
+def nasa_image_url(collection_url: str) -> str | None:
+    """The best large JPEG or PNG listed in a NASA item's file list."""
+    files = HTTP.get(collection_url, timeout=HTTP_TIMEOUT).json()
+    for suffix in ("~large.jpg", "~orig.jpg", "~medium.jpg", "~large.png", "~orig.png"):
+        url = next((u for u in files if isinstance(u, str) and u.lower().endswith(suffix)), None)
+        if url:
+            return _https(url)
     return None
+
+
+def nasa_search(query: str, used: set, min_seconds: float = 0):
+    for c in nasa_candidates(query, per_page=20):
+        if c["id"] in used:
+            continue
+        try:
+            url = nasa_image_url(c["collection"])
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+        if url:
+            return {"kind": "image", "url": url, "id": c["id"], "credit": c["credit"]}
+    return None
+
+
+def pexels_video_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    if not PEXELS_API_KEY:
+        return []
+    r = HTTP.get("https://api.pexels.com/videos/search",
+                 headers={"Authorization": PEXELS_API_KEY},
+                 params={"query": query, "orientation": "landscape", "per_page": per_page, "page": page},
+                 timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for v in r.json().get("videos", []):
+        mp4 = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("link")]
+        files = [f for f in mp4 if (f.get("width") or 0) >= 1280 and (f.get("width") or 0) > (f.get("height") or 0)]
+        if not files:
+            continue
+        best = min(files, key=lambda f: abs(f["width"] - W))
+        small = min(mp4, key=lambda f: f.get("width") or 10 ** 6)
+        who = (v.get("user") or {}).get("name") or "a Pexels contributor"
+        out.append({"kind": "video", "url": best["link"], "id": f"pexels-video:{v['id']}",
+                    "credit": f"Video by {who} on Pexels", "thumb": v.get("image"), "preview": small["link"],
+                    "duration": v.get("duration"), "width": best.get("width"), "height": best.get("height"),
+                    "provider": "Pexels", "source": "stock_video"})
+    return out
 
 
 def pexels_video_search(query: str, used: set, min_seconds: float = 0):
+    return _first_unused(pexels_video_candidates(query), used, min_seconds)
+
+
+def pexels_photo_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
     if not PEXELS_API_KEY:
-        return None
-    r = HTTP.get("https://api.pexels.com/videos/search",
+        return []
+    r = HTTP.get("https://api.pexels.com/v1/search",
                  headers={"Authorization": PEXELS_API_KEY},
-                 params={"query": query, "orientation": "landscape", "per_page": 15},
+                 params={"query": query, "orientation": "landscape", "per_page": per_page, "page": page},
                  timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    videos = [v for v in r.json().get("videos", []) if f"pexels-video:{v['id']}" not in used]
-    videos.sort(key=lambda v: (v.get("duration") or 0) < min_seconds)  # long-enough clips first
-    for v in videos:
-        files = [f for f in v.get("video_files", [])
-                 if f.get("file_type") == "video/mp4"
-                 and (f.get("width") or 0) >= 1280
-                 and (f.get("width") or 0) > (f.get("height") or 0)]
-        if not files:
+    out = []
+    for p in r.json().get("photos", []):
+        src = p.get("src") or {}
+        if not src.get("original"):
             continue
-        best = min(files, key=lambda f: abs(f["width"] - W))
-        return {"kind": "video", "url": best["link"], "id": f"pexels-video:{v['id']}",
-                "credit": f"Video by {v['user']['name']} on Pexels"}
-    return None
+        out.append({"kind": "image", "url": src["original"], "id": f"pexels-photo:{p['id']}",
+                    "credit": f"Photo by {p.get('photographer') or 'a Pexels contributor'} on Pexels",
+                    "thumb": src.get("medium") or src.get("small"), "width": p.get("width"), "height": p.get("height"),
+                    "provider": "Pexels", "source": "stock_photo"})
+    return out
 
 
 def pexels_photo_search(query: str, used: set, min_seconds: float = 0):
-    if not PEXELS_API_KEY:
-        return None
-    r = HTTP.get("https://api.pexels.com/v1/search",
-                 headers={"Authorization": PEXELS_API_KEY},
-                 params={"query": query, "orientation": "landscape", "per_page": 15},
-                 timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    for p in r.json().get("photos", []):
-        asset_id = f"pexels-photo:{p['id']}"
-        if asset_id in used:
-            continue
-        return {"kind": "image", "url": p["src"]["original"], "id": asset_id,
-                "credit": f"Photo by {p['photographer']} on Pexels"}
-    return None
+    return _first_unused(pexels_photo_candidates(query), used)
 
 
-def pixabay_video_search(query: str, used: set, min_seconds: float = 0):
+def pixabay_video_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
     if not PIXABAY_API_KEY:
-        return None
+        return []
     r = HTTP.get("https://pixabay.com/api/videos/",
                  params={"key": PIXABAY_API_KEY, "q": query[:100], "video_type": "film",
-                         "safesearch": "true", "min_width": 1280, "per_page": 15},
+                         "safesearch": "true", "min_width": 1280, "per_page": per_page, "page": page},
                  timeout=HTTP_TIMEOUT)
+    if page > 1 and getattr(r, "status_code", 200) == 400:   # Pixabay's answer to a page past the last result
+        return []
     r.raise_for_status()
-    videos = [v for v in r.json().get("hits", []) if f"pixabay-video:{v['id']}" not in used]
-    videos.sort(key=lambda v: (v.get("duration") or 0) < min_seconds)  # long-enough clips first
-    for v in videos:
-        files = [f for f in (v.get("videos") or {}).values()
-                 if f.get("url") and (f.get("width") or 0) >= 1280
+    out = []
+    for v in r.json().get("hits", []):
+        sizes = v.get("videos") or {}
+        files = [f for f in sizes.values() if f.get("url") and (f.get("width") or 0) >= 1280
                  and (f.get("width") or 0) > (f.get("height") or 0)]
         if not files:
             continue
         best = min(files, key=lambda f: abs(f["width"] - W))
-        return {"kind": "video", "url": best["url"], "id": f"pixabay-video:{v['id']}",
-                "credit": f"Video by {v.get('user', 'a Pixabay contributor')} on Pixabay"}
-    return None
+        small = next((sizes[k] for k in ("tiny", "small", "medium") if (sizes.get(k) or {}).get("url")), best)
+        thumb = next((sizes[k]["thumbnail"] for k in ("medium", "small", "large", "tiny")
+                      if (sizes.get(k) or {}).get("thumbnail")), None)
+        if not thumb and v.get("picture_id"):   # older API responses
+            thumb = f"https://i.vimeocdn.com/video/{v['picture_id']}_640x360.jpg"
+        out.append({"kind": "video", "url": best["url"], "id": f"pixabay-video:{v['id']}",
+                    "credit": f"Video by {v.get('user') or 'a Pixabay contributor'} on Pixabay",
+                    "thumb": thumb, "preview": small["url"], "duration": v.get("duration"),
+                    "width": best.get("width"), "height": best.get("height"),
+                    "provider": "Pixabay", "source": "stock_video"})
+    return out
 
 
-def pixabay_photo_search(query: str, used: set, min_seconds: float = 0):
+def pixabay_video_search(query: str, used: set, min_seconds: float = 0):
+    return _first_unused(pixabay_video_candidates(query), used, min_seconds)
+
+
+def pixabay_photo_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
     """Standard Pixabay keys get images up to 1280 px wide, so these are upscaled to 1080p."""
     if not PIXABAY_API_KEY:
-        return None
+        return []
     r = HTTP.get("https://pixabay.com/api/",
                  params={"key": PIXABAY_API_KEY, "q": query[:100], "image_type": "photo",
                          "orientation": "horizontal", "safesearch": "true", "min_width": 1280,
-                         "per_page": 15},
+                         "per_page": per_page, "page": page},
                  timeout=HTTP_TIMEOUT)
+    if page > 1 and getattr(r, "status_code", 200) == 400:
+        return []
     r.raise_for_status()
+    out = []
     for p in r.json().get("hits", []):
-        asset_id = f"pixabay-photo:{p['id']}"
-        if asset_id in used or not p.get("largeImageURL"):
+        if not p.get("largeImageURL"):
             continue
-        return {"kind": "image", "url": p["largeImageURL"], "id": asset_id,
-                "credit": f"Photo by {p.get('user', 'a Pixabay contributor')} on Pixabay"}
-    return None
+        out.append({"kind": "image", "url": p["largeImageURL"], "id": f"pixabay-photo:{p['id']}",
+                    "credit": f"Photo by {p.get('user') or 'a Pixabay contributor'} on Pixabay",
+                    "thumb": p.get("webformatURL") or p.get("previewURL"),
+                    "width": p.get("imageWidth"), "height": p.get("imageHeight"),
+                    "provider": "Pixabay", "source": "stock_photo"})
+    return out
+
+
+def pixabay_photo_search(query: str, used: set, min_seconds: float = 0):
+    return _first_unused(pixabay_photo_candidates(query), used)
 
 
 # Stock providers in order of preference; each one is skipped when its key is not set.
@@ -678,6 +747,28 @@ def stock_photo_search(query: str, used: set, min_seconds: float = 0):
 def stock_providers() -> list[str]:
     """Names of the stock-footage providers that have an API key configured."""
     return [name for name, key in (("Pexels", PEXELS_API_KEY), ("Pixabay", PIXABAY_API_KEY)) if key]
+
+
+CANDIDATE_PROVIDERS = {
+    "nasa": [("NASA", "nasa_candidates")],
+    "stock_video": [("Pexels", "pexels_video_candidates"), ("Pixabay", "pixabay_video_candidates")],
+    "stock_photo": [("Pexels", "pexels_photo_candidates"), ("Pixabay", "pixabay_photo_candidates")],
+}
+
+
+def search_candidates(source: str, query: str, page: int = 1) -> tuple[list[dict], list[str]]:
+    """Every provider's results for one kind of source, interleaved, for the visual picker. Returns (results, errors)."""
+    providers = [(name, globals()[fn]) for name, fn in CANDIDATE_PROVIDERS[source]]
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        futures = [(name, pool.submit(fn, query, PER_PAGE, page)) for name, fn in providers]
+    lists, errors = [], []
+    for name, future in futures:
+        try:
+            lists.append(future.result())
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            errors.append(f"{name} search failed: {e}")
+    results = [c for group in itertools.zip_longest(*lists) for c in group if c]
+    return results, errors
 
 
 SEARCHERS = {"nasa": nasa_search, "stock_video": stock_video_search, "stock_photo": stock_photo_search}
@@ -728,10 +819,12 @@ def rejected_assets(project: Path) -> set:
     return set(load_json(path)) if path.exists() else set()
 
 
-def reject_asset(project: Path, asset_id: str) -> None:
-    """Remember a visual you swapped out so 'find another' never offers it again."""
-    ids = rejected_assets(project) | {asset_id}
-    save_json(project / "rejected_assets.json", sorted(ids))
+def reject_asset(project: Path, asset_id: str, rejected: bool = True) -> None:
+    """Remember a visual you swapped out so 'find another' never offers it again (rejected=False forgets that)."""
+    before = rejected_assets(project)
+    ids = before | {asset_id} if rejected else before - {asset_id}
+    if ids != before:
+        save_json(project / "rejected_assets.json", sorted(ids))
 
 
 def gather_visuals(project: Path, script: dict, timeline: list[dict]) -> list[dict]:
@@ -781,6 +874,24 @@ def refetch_visual(project: Path, script: dict, timeline: list[dict], i: int) ->
     store_asset(project, manifest, i, asset, download_from=asset["url"])
     if old:
         reject_asset(project, old["id"])
+    log(f"Scene {i + 1} now uses: {asset['credit']}")
+    return asset
+
+
+def use_visual(project: Path, i: int, picked: dict) -> dict:
+    """Use a search result picked in the web UI for scene i. NASA results get their full-size image looked up first."""
+    url = picked.get("url") or (nasa_image_url(picked["collection"]) if picked.get("collection") else None)
+    if not url:
+        raise RuntimeError("That result has no downloadable file; pick another one")
+    manifest = load_manifest(project)
+    old = manifest[i] if i < len(manifest) else None
+    asset = {"kind": picked["kind"], "url": url, "id": picked["id"], "credit": picked.get("credit", ""),
+             "query": picked.get("query", ""), "source": picked.get("source", "")}
+    log(f"Downloading the {asset['kind']} you picked for scene {i + 1} ({picked.get('provider', asset['source'])})")
+    store_asset(project, manifest, i, asset, download_from=url)
+    if old and old.get("id") != asset["id"]:
+        reject_asset(project, old["id"])
+    reject_asset(project, asset["id"], rejected=False)
     log(f"Scene {i + 1} now uses: {asset['credit']}")
     return asset
 

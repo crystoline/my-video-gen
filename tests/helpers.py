@@ -35,19 +35,22 @@ class Fakes:
         self.scene_count = 4
         self.plans: list = []
         self.factchecks = 0
+        self.channels_used: list = []
+        self.voices: list = []
 
-    def write_script(self, topic, minutes, previous):
+    def write_script(self, topic, minutes, previous, channel=None):
+        self.channels_used.append((channel or {}).get("id"))
         return {"title": f"Title for {topic}", "description": "Desc", "tags": ["a", "b"],
                 "thumbnail_text": "BIG TEXT", "topic": topic,
                 "scenes": [{"narration": f"This is narration number {k} for the test video.",
                             "visual": {"source": "nasa", "query": f"query {k}"}} for k in range(self.scene_count)]}
 
-    def plan_visuals(self, title, narrations):
+    def plan_visuals(self, title, narrations, channel=None):
         self.plans.append(list(narrations))
         return {"description": f"About {title}", "tags": ["one", "two"], "thumbnail_text": "WOW",
                 "visuals": [{"source": "stock_photo", "query": f"planned {k}"} for k in range(len(narrations))]}
 
-    def fact_check(self, script, project_dir):
+    def fact_check(self, script, project_dir, channel=None):
         self.factchecks += 1
         time.sleep(self.factcheck_delay)
         (project_dir / "factcheck_notes.md").write_text("Full notes", encoding="utf-8")
@@ -63,9 +66,10 @@ class Fakes:
         shade = (self.visuals * 37) % 255
         dest.write_bytes(png_bytes((shade, 100, 255 - shade)))
 
-    def tts(self, text, mp3, align_path, prev_text="", next_text=""):
+    def tts(self, text, mp3, align_path, prev_text="", next_text="", voice_id=None):
         """A sine tone as long as the text would take to say, with evenly spread character timing."""
         self.tts_calls.append(mp3.name)
+        self.voices.append(voice_id)
         dur = 0.8 + 0.035 * len(text)
         pl.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=330:duration={dur:.2f}",
                 "-ar", "44100", "-ac", "1", mp3])

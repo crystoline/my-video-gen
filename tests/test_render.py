@@ -149,7 +149,7 @@ def test_full_flow_from_voiceover_to_upload(client, fakes, monkeypatch):
     assert "Already uploaded" in j["error"]
 
     # Rewriting starts over and keeps the old narration and renders in .trash
-    monkeypatch.setattr(pl, "write_script", lambda topic, minutes, previous:
+    monkeypatch.setattr(pl, "write_script", lambda topic, minutes, previous, channel=None:
                         dict(fakes.write_script(topic, minutes, previous), title="Rewritten"))
     run_job(client, slug, action="rewrite", minutes=2)
     p = project(client, slug)

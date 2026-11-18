@@ -193,6 +193,7 @@ def project_state(slug: str, detail: bool = False) -> dict:
     p = pl.PROJECTS_DIR / slug
     script = load_script(p)
     meta = pl.load_meta(p)
+    channel = pl.get_channel(meta.get("channel"))
     job = busy(slug)
     scenes = script["scenes"] if script else []
     n = len(scenes)
@@ -236,6 +237,8 @@ def project_state(slug: str, detail: bool = False) -> dict:
         "title": (script or {}).get("title") or meta.get("topic") or slug,
         "topic": (script or {}).get("topic") or meta.get("topic", ""),
         "source": meta.get("source", "claude"),
+        "channel": {k: channel[k] for k in ("id", "name")},
+        "language": meta.get("language") or channel.get("language") or "en",
         "step": step, "scenes": n, "words": words, "chars": chars,
         "minutes": round(words / pl.WORDS_PER_MINUTE, 1),
         "voice_todo": todo, "voice_todo_chars": todo_chars,
@@ -455,15 +458,17 @@ def run_factcheck(p: Path, script: dict) -> None:
 
 def job_create(slug: str, topic: str, minutes: float) -> None:
     p = pl.PROJECTS_DIR / slug
-    pl.log(f"Writing script: {topic}")
-    script = pl.write_script(topic, minutes, pl.previous_titles(p))
+    channel = pl.project_channel(p)
+    pl.log(f"Writing script: {topic} (channel: {channel['name']})")
+    script = pl.write_script(topic, minutes, pl.previous_titles(p, channel_id=channel["id"]), channel=channel)
     pl.save_json(p / "script.json", script)
     run_factcheck(p, script)
 
 
 def job_create_manual(slug: str, title: str, suggest: bool, factcheck: bool) -> None:
     p = pl.PROJECTS_DIR / slug
-    script = pl.script_from_text(title, (p / MANUAL_TEXT).read_text(encoding="utf-8"), suggest)
+    script = pl.script_from_text(title, (p / MANUAL_TEXT).read_text(encoding="utf-8"), suggest,
+                                 channel=pl.project_channel(p))
     words, chars = pl.narration_stats(script)
     pl.log(f"Your script: {len(script['scenes'])} scenes, {words} words, {chars} characters (about "
            f"{words / pl.WORDS_PER_MINUTE:.1f} min)")
@@ -484,8 +489,9 @@ def job_rewrite(slug: str, minutes: float) -> None:
     p = pl.PROJECTS_DIR / slug
     old = need_script(p)
     topic = old.get("topic") or old.get("title")
+    channel = pl.project_channel(p)
     pl.log(f"Rewriting the script from scratch: {topic}")
-    script = pl.write_script(topic, minutes, pl.previous_titles(p))
+    script = pl.write_script(topic, minutes, pl.previous_titles(p, channel_id=channel["id"]), channel=channel)
     # The old narration, visuals and renders no longer match; keep them in .trash rather than deleting
     move_to_trash(p, ["script.json", "factcheck.json", "factcheck_notes.md", "review.md", "audio", "assets",
                       "assets.json", "rejected_assets.json", "segments", "timeline.json", "video_only.mp4",
@@ -721,13 +727,24 @@ def api_create_project():
     p = project_dir(slug, must_exist=False)
     if (p / "script.json").exists() or busy(slug):
         abort(409, f"A video for this topic already exists ({slug})")
+    channel = channel_id(data)
     p.mkdir(parents=True, exist_ok=True)
-    pl.save_json(p / "project.json", {"topic": topic, "minutes": minutes, "created": datetime.now().isoformat()})
+    pl.save_json(p / "project.json", {"topic": topic, "minutes": minutes, "channel": channel,
+                                      "created": datetime.now().isoformat()})
     job = enqueue(slug, "create", "Write and fact-check the script", job_create, slug=slug, topic=topic, minutes=minutes)
     if data.get("from_queue") and TOPICS_PATH.exists():
         comments, topics = read_queue()
         write_queue(comments, [t for t in topics if t != topic])
     return jsonify({"slug": slug, "job": job.to_dict()})
+
+
+def channel_id(data: dict) -> str:
+    """The channel a new video belongs to: the one asked for, or the default channel."""
+    channels = pl.load_channels()
+    wanted = data.get("channel") or channels["default"]
+    if wanted not in {c["id"] for c in channels["channels"]}:
+        raise ValueError("Unknown channel")
+    return wanted
 
 
 def create_manual_project(data: dict):
@@ -749,11 +766,13 @@ def create_manual_project(data: dict):
     p = project_dir(slug, must_exist=False)
     if (p / "script.json").exists() or busy(slug):
         abort(409, f"A video with this title already exists ({slug})")
+    channel = channel_id(data)
     p.mkdir(parents=True, exist_ok=True)
     (p / MANUAL_TEXT).write_text(text, encoding="utf-8")   # kept, so nothing is lost if preparing it fails
     words = len(" ".join(s["narration"] for s in scenes).split())
     suggest, factcheck = bool(data.get("suggest", True)), bool(data.get("factcheck", True))
     pl.save_meta(p, {"topic": title, "minutes": round(words / pl.WORDS_PER_MINUTE, 1), "source": "manual",
+                     "channel": channel,
                      "manual": {"suggest": suggest, "factcheck": factcheck}, "created": datetime.now().isoformat()})
     job = start_manual_job(slug, title, suggest, factcheck)
     return jsonify({"slug": slug, "job": job.to_dict(), "scenes": len(scenes)})
@@ -889,6 +908,45 @@ def api_start_job(slug):
     else:
         raise ValueError(f"Unknown action: {action}")
     return jsonify(job.to_dict())
+
+
+@app.get("/api/channels")
+def api_channels():
+    data = pl.load_channels()
+    return jsonify(dict(data, categories=pl.YT_CATEGORIES, languages=pl.LANGUAGES,
+                        tracks=[t.name for t in pl.music_tracks()]))
+
+
+@app.put("/api/channels")
+def api_save_channels():
+    data = body()
+    raw = data.get("channels")
+    if not isinstance(raw, list) or not raw or not all(isinstance(c, dict) for c in raw):
+        raise ValueError("Keep at least one channel")
+    renamed = {}
+    channels = []
+    for c in raw:   # a channel added in the browser gets its id from its name
+        new_id = str(c.get("id") or "").startswith("new-")
+        cleaned = pl.clean_channel(dict(c, id=None) if new_id else c)
+        renamed[str(c.get("id"))] = cleaned["id"]
+        channels.append(cleaned)
+    ids = [c["id"] for c in channels]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Two channels have the same name")
+    default = renamed.get(str(data.get("default")), data.get("default"))
+    default = default if default in ids else ids[0]
+    pl.save_channels({"default": default, "channels": channels})
+    return api_channels()
+
+
+@app.put("/api/projects/<slug>/channel")
+def api_project_channel(slug):
+    p = project_dir(slug)
+    require_idle(slug)
+    meta = pl.load_meta(p)
+    meta["channel"] = channel_id(body())
+    pl.save_meta(p, meta)
+    return jsonify(project_state(slug, detail=True))
 
 
 @app.put("/api/projects/<slug>/short")
@@ -1271,6 +1329,9 @@ def api_status():
         "voice_tones": list(pl.VOICE_TONES),
         "problems": pl.settings_problems(), "projects_dir": str(pl.PROJECTS_DIR),
         "stock_providers": pl.stock_providers(), "providers": providers_status(),
+        "channels": {"default": (ch := pl.load_channels())["default"],
+                     "list": [{"id": c["id"], "name": c["name"], "minutes": c["minutes"]} for c in ch["channels"]]},
+        "languages": pl.LANGUAGES,
     })
 
 

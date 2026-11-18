@@ -175,17 +175,32 @@ async function showProjects() {
   await refreshProjectCards();
 }
 
+// A channel dropdown (only when there is more than one channel). onPick(id) is called on change.
+function channelSelect(value, onPick) {
+  const ch = (S.status && S.status.channels) || { list: [] };
+  if (ch.list.length < 2) return null;
+  return h("select", { title: "Channel", onchange: e => onPick(e.target.value) },
+    ch.list.map(c => h("option", { value: c.id, selected: c.id === (value || ch.default) ? true : null }, c.name)));
+}
+function defaultChannel() { const ch = S.status && S.status.channels; return ch ? ch.list.find(c => c.id === ch.default) : null; }
+
 function claudeForm() {
+  let channel = S.status.channels.default;
   const topic = h("input", { class: "grow", placeholder: "Topic, e.g. Why do stars twinkle?", required: true, maxlength: 200 });
-  const minutes = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: 6, style: "width:5.5rem" });
+  const minutes = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: (defaultChannel() || {}).minutes || 6, style: "width:5.5rem" });
+  const pickChannel = channelSelect(channel, id => {
+    channel = id;
+    const c = S.status.channels.list.find(x => x.id === id);
+    if (c) minutes.value = c.minutes;
+  });
   return h("form", { class: "stack", onsubmit: async e => {
     e.preventDefault();
     try {
-      const r = await api("POST", "/api/projects", { topic: topic.value, minutes: Number(minutes.value) });
+      const r = await api("POST", "/api/projects", { topic: topic.value, minutes: Number(minutes.value), channel });
       location.hash = `#/p/${r.slug}`;
     } catch (err) { toast(err.message, true); }
   } },
-    h("div", { class: "row" }, topic, h("label", { class: "row" }, minutes, h("span", { class: "muted small" }, "minutes")),
+    h("div", { class: "row" }, pickChannel, topic, h("label", { class: "row" }, minutes, h("span", { class: "muted small" }, "minutes")),
       h("button", { class: "primary", type: "submit" }, "Write script")),
     h("p", { class: "muted small" }, "Claude writes the script and fact-checks it with web searches (a few cents). Nothing is narrated or spent on ElevenLabs until you approve the script."));
 }
@@ -210,14 +225,17 @@ function manualForm() {
     oninput: () => { stats.textContent = manualStats(text.value); } });
   const suggest = h("input", { type: "checkbox", checked: true });
   const check = h("input", { type: "checkbox", checked: true });
+  let channel = S.status.channels.default;
+  const pickChannel = channelSelect(channel, id => { channel = id; });
   return h("form", { class: "stack", onsubmit: async e => {
     e.preventDefault();
     try {
       const r = await api("POST", "/api/projects", { mode: "manual", title: title.value, script: text.value,
-        suggest: suggest.checked, factcheck: check.checked });
+        suggest: suggest.checked, factcheck: check.checked, channel });
       location.hash = `#/p/${r.slug}`;
     } catch (err) { toast(err.message, true); }
   } },
+    pickChannel ? h("label", {}, h("span", {}, "Channel"), pickChannel) : null,
     h("label", {}, h("span", {}, "Title"), title),
     h("label", {}, h("span", {}, "Narration, exactly as it should be spoken"), text),
     stats,
@@ -408,7 +426,12 @@ function renderProject() {
   $app.replaceChildren(
     h("div", { class: "row between" },
       h("div", {}, h("h1", {}, (S.draft && S.draft.title) || p.title),
-        h("div", { class: "muted small" }, p.topic ? `Topic: ${p.topic}` : "", p.scenes ? ` · ${p.scenes} scenes · ${p.words} words · ~${p.minutes} min` : "")),
+        h("div", { class: "muted small row" }, p.topic ? `Topic: ${p.topic}` : "", p.scenes ? ` · ${p.scenes} scenes · ${p.words} words · ~${p.minutes} min` : "",
+          p.language && p.language !== "en" ? chip((S.status.languages || {})[p.language] || p.language) : null,
+          channelSelect(p.channel.id, async id => {
+            try { S.project = await api("PUT", `/api/projects/${encodeURIComponent(p.slug)}/channel`, { channel: id }); renderProject(); toast(`Channel: ${S.project.channel.name}`); }
+            catch (e) { toast(e.message, true); renderProject(); }
+          }))),
       p.youtube ? h("a", { class: "btn", href: p.youtube.url, target: "_blank", rel: "noopener" }, "Open on YouTube") : null),
     stepsBar(p),
     h("div", { id: "jobbanner", hidden: true }),
@@ -1064,7 +1087,9 @@ async function showQueue() {
 }
 
 function renderQueue(q) {
-  const minutes = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: 6, style: "width:5.5rem" });
+  const minutes = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: (defaultChannel() || {}).minutes || 6, style: "width:5.5rem" });
+  let channel = S.status.channels.default;
+  const pickChannel = channelSelect(channel, id => { channel = id; });
   const add = h("input", { class: "grow", placeholder: "New topic", maxlength: 200 });
   const save = async topics => { try { renderQueue(await api("PUT", "/api/queue", { topics })); } catch (e) { toast(e.message, true); } };
   const topics = q.topics.slice();
@@ -1073,13 +1098,14 @@ function renderQueue(q) {
     h("p", { class: "muted" }, "Scheduled runs (pipeline.py --topics-file topics.txt --yes) take the top topic. Here you can reorder the queue, or start a video from any topic and review it before it is narrated."),
     h("form", { class: "panel row", onsubmit: e => { e.preventDefault(); if (add.value.trim()) save(topics.concat([add.value.trim()])); } },
       add, h("button", { class: "primary", type: "submit" }, "Add to queue"),
-      h("label", { class: "row" }, h("span", { class: "muted small", style: "margin:0" }, "Length for new videos"), minutes)),
+      h("label", { class: "row" }, h("span", { class: "muted small", style: "margin:0" }, "Length for new videos"), minutes),
+      pickChannel ? h("label", { class: "row" }, h("span", { class: "muted small", style: "margin:0" }, "Channel"), pickChannel) : null),
     h("div", { class: "panel" }, topics.length ? topics.map((t, i) => h("div", { class: "queue-item" },
       h("span", { class: "muted small" }, `${i + 1}.`), h("span", { class: "t" }, t),
       q.existing[t] ? h("a", { class: "btn small", href: `#/p/${q.existing[t]}` }, "Open video")
         : h("button", { class: "small", onclick: async () => {
           try {
-            const r = await api("POST", "/api/projects", { topic: t, minutes: Number(minutes.value), from_queue: true });
+            const r = await api("POST", "/api/projects", { topic: t, minutes: Number(minutes.value), from_queue: true, channel });
             location.hash = `#/p/${r.slug}`;
           } catch (e) { toast(e.message, true); }
         } }, "Start video"),
@@ -1098,6 +1124,7 @@ function renderQueue(q) {
 async function showSettings() {
   S.status = await api("GET", "/api/status");
   S.music = await api("GET", "/api/music");
+  S.channels = await api("GET", "/api/channels");
   const projects = await api("GET", "/api/projects");
   renderSettings(projects.filter(p => p.voice_todo.length < p.scenes));
 }
@@ -1118,6 +1145,7 @@ function renderSettings(voiced) {
   $app.replaceChildren(
     h("h1", {}, "Settings"),
     st.problems.length ? h("div", { class: "panel callout bad" }, h("strong", {}, "Problems: "), st.problems.join("; ")) : null,
+    channelsPanel(voiced),
     h("div", { class: "panel stack" }, h("h2", {}, "Sound"),
       h("div", { class: "field-grid" },
         h("label", {}, h("span", {}, "Background music for videos without their own choice"),
@@ -1171,6 +1199,64 @@ function renderSettings(voiced) {
     aiPanel(vals),
     h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { if (await save()) renderSettings(voiced); } }, "Save settings")),
     statusPanel(st));
+}
+
+// Channels (channels.json): what each channel is about and how it sounds. Saved separately from .env.
+function channelsPanel(voiced) {
+  const data = S.channels;
+  const list = data.channels.map(c => Object.assign({}, c));
+  let def = data.default, open = S.openChannel || list[0].id;
+  const box = h("div", { class: "stack" });
+  const field = (c, key, label, opts) => {
+    opts = opts || {};
+    const input = opts.rows ? h("textarea", { rows: opts.rows, maxlength: opts.max, oninput: e => { c[key] = e.target.value; } }, c[key] || "")
+      : h("input", { value: c[key] == null ? "" : c[key], maxlength: opts.max, type: opts.type || "text", style: "width:100%",
+        oninput: e => { c[key] = opts.type === "number" ? Number(e.target.value) : e.target.value; } });
+    return h("label", { style: opts.wide ? "grid-column:1/-1" : null }, h("span", {}, label), input);
+  };
+  const select = (c, key, label, options) => h("label", {}, h("span", {}, label),
+    h("select", { onchange: e => { c[key] = e.target.value; } },
+      options.map(([v, text]) => h("option", { value: v, selected: String(c[key] || "") === String(v) ? true : null }, text))));
+  const draw = () => {
+    box.replaceChildren(
+      h("div", { class: "row" }, list.map(c => h("button", { class: "small" + (c.id === open ? " primary" : ""), onclick: () => { open = c.id; S.openChannel = c.id; draw(); } },
+        c.name || "New channel", c.id === def ? " ★" : "")),
+        h("button", { class: "small", onclick: () => {
+          const c = Object.assign({}, list[0], { id: "", name: "New channel", about: "", voice: "", accuracy: "", visuals: "", voice_id: "", music: "" });
+          c.id = `new-${Date.now()}`; list.push(c); open = c.id; draw();
+        } }, "+ Add channel")),
+      ...list.filter(c => c.id === open).map(c => h("div", { class: "stack" },
+        h("div", { class: "field-grid" },
+          field(c, "name", "Name", { max: 60 }),
+          select(c, "category", "YouTube category", Object.entries(data.categories)),
+          select(c, "language", "Narration language", Object.entries(data.languages)),
+          field(c, "minutes", "Default length (minutes)", { type: "number" }),
+          field(c, "about", "What the channel is about (the writer and fact-checker are told this)", { max: 300, wide: true }),
+          field(c, "voice", "Writing voice and style", { rows: 3, max: 1500, wide: true }),
+          field(c, "accuracy", "Accuracy rules and sources to prefer", { rows: 2, max: 800, wide: true }),
+          field(c, "visuals", "Tips for choosing visuals (optional), e.g. “prefer archive photos of the period”", { rows: 2, max: 800, wide: true }),
+          field(c, "voice_id", "ElevenLabs voice ID for this channel (empty = the one in .env)", { max: 64 }),
+          select(c, "music", "Music for this channel's videos", [["", "The default music"], ["none", "No music"], ...data.tracks.map(t => [t, t])])),
+        h("div", { class: "row" },
+          h("label", { class: "row" }, h("input", { type: "radio", name: "defch", checked: c.id === def, onchange: () => { def = c.id; draw(); } }),
+            h("span", { style: "margin:0" }, "Default channel (new videos and the topic queue)")),
+          list.length > 1 ? h("button", { class: "small danger", onclick: () => {
+            if (!confirm(`Delete the channel “${c.name}”? Its videos switch to the default channel.`)) return;
+            list.splice(list.indexOf(c), 1); if (def === c.id) def = list[0].id; open = list[0].id; draw();
+          } }, "Delete channel") : null))),
+      h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => {
+        try {
+          S.channels = await api("PUT", "/api/channels", { default: def, channels: list });
+          S.status = await api("GET", "/api/status");
+          S.openChannel = S.channels.channels.some(c => c.id === open) ? open : S.channels.default;
+          toast("Channels saved"); renderSettings(voiced);
+        } catch (e) { toast(e.message, true); }
+      } }, "Save channels")));
+  };
+  draw();
+  return h("div", { class: "panel stack" }, h("h2", {}, "Channels"),
+    h("p", { class: "muted small" }, "Each video belongs to a channel. The script writer, fact-checker and visual planner follow its description, and its videos use its voice, music, language and YouTube category. Add one per subject (history, nature, finance…) or per YouTube channel."),
+    box);
 }
 
 // Visual providers: switch on/off and order (first = tried first). Keys stay in .env.

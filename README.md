@@ -33,7 +33,7 @@ cp .env.example .env
 
 If your system Python is older than 3.10 (Ubuntu 20.04 ships 3.8), get a newer one without touching the system Python via [uv](https://docs.astral.sh/uv/): run `curl -LsSf https://astral.sh/uv/install.sh | sh`, then `uv python install 3.12`, and create the venv with `python3.12 -m venv .venv` instead.
 
-`.env`, `client_secret.json`, `youtube_token.json` and `projects/` are listed in `.gitignore`, so they stay out of version control.
+`.env`, `client_secret.json`, `youtube_token.json`, `channels.json`, `music/` and `projects/` are listed in `.gitignore`, so they stay out of version control.
 
 ## 2. Get your keys (put them in `.env`)
 
@@ -108,6 +108,7 @@ Then open http://localhost:8765. From WSL, open it in your normal Windows browse
 - **Video:** render, watch, choose this video's music track, preview the sound, edit the chapters, update the thumbnail, and upload to YouTube with privacy and schedule options. Chapters are suggested by Claude when the video renders (`AUTO_CHAPTERS`) and added to the description as timestamps, as long as they meet YouTube's rules (at least 3, the first at 0:00, each at least 10 seconds).
 - **Short:** make a vertical YouTube Short from a run of scenes (by default the opening scenes, up to about a minute), with large captions and the title at the top, then upload it. It reuses the narration and visuals, so it costs nothing extra; its description links to the full video if that is uploaded first.
 - **Topic queue:** reorder `topics.txt`, start a video from any topic, and send failed topics back to the queue.
+- **Channels (Settings):** each video belongs to a channel: what it is about, its writing voice, accuracy rules and preferred sources, tips for visuals, YouTube category, narration language, its own ElevenLabs voice and music, and a default length. The script writer, fact-checker and visual planner follow it, so the same tool can make history, nature or finance videos, or serve several YouTube channels. The built-in "Science & space" channel is used until you add others; channels are saved in `channels.json`. On the command line, pick one with `--channel <id>`.
 - **Settings:** default music (one track, or a different track per video), the music library (listen to tracks, add new ones), music level, ducking, voice tone and ElevenLabs voice settings, with a 45-second preview mixed from a real video. It also shows how many ElevenLabs characters you have left this month. Settings are saved to `.env`, so the command line uses them too.
 
 Anything that spends money asks first and shows the ElevenLabs character count next to what is left on your plan. Jobs run one at a time, and their logs are kept in each project's `activity.log`. The web interface and the command line work on the same project folders, so you can mix them.

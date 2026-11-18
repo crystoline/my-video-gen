@@ -6,6 +6,7 @@ youtube_token.json
 # Generated videos, audio, downloaded assets and queue state
 projects/
 music/
+channels.json
 topics_done.txt
 topics_failed.txt
 pipeline.log

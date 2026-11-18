@@ -289,21 +289,112 @@ class FactCheck(BaseModel):
                     "each followed by the source consulted if there was one")
 
 
-WRITER_SYSTEM = """You are the head writer for a faceless YouTube channel about science, planet Earth and astronomy.
+# ----------------------------------------------------------------------------
+# Channels: what a channel is about and how it sounds. Every video belongs to one; the writer, fact-checker,
+# visual planner, voice, music and YouTube upload follow it. Kept in channels.json (edited in Settings).
+# ----------------------------------------------------------------------------
+DEFAULT_CHANNEL = {
+    "id": "science", "name": "Science & space",
+    "about": "science, planet Earth and astronomy",
+    "voice": "Curious, warm and clear, like a great science teacher who loves the subject. Explain with concrete "
+             "comparisons and real numbers with units. Open with a hook in the first two sentences (a question or a "
+             "surprising fact), then pay it off by the end.",
+    "accuracy": "Prefer figures from NASA, ESA, USGS, NOAA and peer-reviewed consensus. Round numbers sensibly.",
+    "visuals": "", "category": "28", "language": "en", "voice_id": "", "music": "", "minutes": 6,
+}
+YT_CATEGORIES = {"1": "Film & Animation", "2": "Autos & Vehicles", "10": "Music", "15": "Pets & Animals",
+                 "17": "Sports", "19": "Travel & Events", "20": "Gaming", "22": "People & Blogs", "23": "Comedy",
+                 "24": "Entertainment", "25": "News & Politics", "26": "Howto & Style", "27": "Education",
+                 "28": "Science & Technology", "29": "Nonprofits & Activism"}
+LANGUAGES = {"en": "English", "es": "Spanish", "pt": "Portuguese", "fr": "French", "de": "German", "it": "Italian",
+             "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "ru": "Russian", "uk": "Ukrainian", "ar": "Arabic",
+             "hi": "Hindi", "bn": "Bengali", "id": "Indonesian", "vi": "Vietnamese", "th": "Thai", "ja": "Japanese",
+             "ko": "Korean", "zh-Hans": "Chinese (Simplified)", "sw": "Swahili", "yo": "Yoruba", "fil": "Filipino"}
 
-Voice: curious, warm and clear, like a great science teacher who loves the subject. Explain with concrete comparisons and real numbers with units. Open with a hook in the first two sentences (a question or a surprising fact), then pay it off by the end.
+
+def channels_path() -> Path:
+    return _path("CHANNELS_FILE", "channels.json")
+
+
+def load_channels() -> dict:
+    """{"default": id, "channels": [...]}, with the built-in science channel when nothing is saved yet."""
+    path = channels_path()
+    try:
+        data = load_json(path) if path.exists() else {}
+    except ValueError:
+        data = {}
+    channels = [dict(DEFAULT_CHANNEL, **c) for c in data.get("channels") or [] if isinstance(c, dict) and c.get("id")]
+    if not channels:
+        channels = [dict(DEFAULT_CHANNEL)]
+    default = data.get("default") if any(c["id"] == data.get("default") for c in channels) else channels[0]["id"]
+    return {"default": default, "channels": channels}
+
+
+def save_channels(data: dict) -> None:
+    save_json(channels_path(), data)
+
+
+def get_channel(channel_id: str | None = None) -> dict:
+    data = load_channels()
+    return next((c for c in data["channels"] if c["id"] == channel_id), None) or \
+        next(c for c in data["channels"] if c["id"] == data["default"])
+
+
+def project_channel(project: Path) -> dict:
+    return get_channel(load_meta(project).get("channel"))
+
+
+def clean_channel(c: dict) -> dict:
+    """Check a channel edited in the web UI."""
+    def text(key, limit, required=False):
+        value = " ".join(str(c.get(key) or "").split()) if key != "voice" else str(c.get(key) or "").strip()
+        if required and not value:
+            raise ValueError(f"Channel {key} cannot be empty")
+        if len(value) > limit:
+            raise ValueError(f"Channel {key} is longer than {limit} characters")
+        return value
+    cid = slugify(str(c.get("id") or c.get("name") or ""), 40)
+    out = {"id": cid, "name": text("name", 60, True), "about": text("about", 300, True), "voice": text("voice", 1500),
+           "accuracy": text("accuracy", 800), "visuals": text("visuals", 800), "voice_id": text("voice_id", 64),
+           "music": text("music", 200)}
+    out["category"] = str(c.get("category") or "28")
+    out["language"] = str(c.get("language") or "en")
+    if out["category"] not in YT_CATEGORIES:
+        raise ValueError("Unknown YouTube category")
+    if out["language"] not in LANGUAGES:
+        raise ValueError("Unknown language")
+    if out["voice_id"] and not re.fullmatch(r"[A-Za-z0-9]{8,64}", out["voice_id"]):
+        raise ValueError("An ElevenLabs voice ID is letters and digits only")
+    try:
+        out["minutes"] = float(c.get("minutes") or 6)
+    except (TypeError, ValueError):
+        raise ValueError("Default length must be a number of minutes")
+    if not 1 <= out["minutes"] <= 30:
+        raise ValueError("Default length must be between 1 and 30 minutes")
+    return out
+
+
+def writer_system(channel: dict | None = None) -> str:
+    ch = channel or get_channel()
+    language = LANGUAGES.get(ch.get("language") or "en", "English")
+    return f"""You are the head writer for a faceless YouTube channel about {ch['about']}.
+
+Voice: {ch['voice'] or 'Clear, warm and engaging. Open with a hook in the first two sentences, then pay it off by the end.'}
 
 Accuracy rules (non-negotiable):
-- Only state things that are well established. Where scientists disagree or numbers are uncertain, say so plainly.
-- No clickbait claims such as "scientists are baffled", "NASA is hiding this" or "this changes everything".
-- Prefer figures from NASA, ESA, USGS, NOAA and peer-reviewed consensus. Round numbers sensibly.
-- Never invent quotes, studies, people or missions.
+- Only state things that are well established. Where experts disagree or facts are uncertain, say so plainly.
+- No clickbait claims such as "experts are baffled", "they don't want you to know" or "this changes everything".
+- {ch['accuracy'] or 'Prefer primary and authoritative sources. Round numbers sensibly.'}
+- Never invent quotes, studies, people or events.
 
-Write for the ear: short sentences, no parentheses, no lists, and spell out symbols ("degrees Celsius", not "°C")."""
+Write the narration in {language}, for the ear: short sentences, no parentheses, no lists, and spell out symbols ("degrees Celsius", not "°C")."""
 
-FACTCHECK_SYSTEM = """You are a meticulous science fact-checker for a YouTube channel about science, Earth and astronomy.
 
-Check every number, date, name and causal claim. When you can search the web, verify against primary sources (NASA, ESA, USGS, NOAA, peer-reviewed papers, university pages) instead of relying on memory, and prefer the most recent figures. Flag substance only, never style. Corrected narration must keep the original length and tone."""
+def factcheck_system(channel: dict | None = None) -> str:
+    ch = channel or get_channel()
+    return f"""You are a meticulous fact-checker for a YouTube channel about {ch['about']}.
+
+Check every number, date, name, quote and causal claim. When you can search the web, verify against primary and authoritative sources instead of relying on memory, and prefer the most recent figures. {ch['accuracy']} Flag substance only, never style. Corrected narration must keep the original length, tone and language."""
 
 _client = None
 
@@ -368,13 +459,17 @@ def claude_research(model: str, system: str, prompt: str, max_searches: int,
     return response_text(resp), searches
 
 
-def previous_titles(exclude: Path, limit: int = 40) -> list[str]:
-    """Titles of videos already made in projects/, newest first, so the writer avoids repeating them."""
+def previous_titles(exclude: Path, limit: int = 40, channel_id: str | None = None) -> list[str]:
+    """Titles of videos already made in projects/ (for one channel, if given), newest first, so the writer
+    avoids repeating them."""
     if not PROJECTS_DIR.exists():
         return []
+    default = load_channels()["default"]
     titles = []
     for path in sorted(PROJECTS_DIR.glob("*/script.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         if path.parent.resolve() == exclude.resolve():
+            continue
+        if channel_id and (load_meta(path.parent).get("channel") or default) != channel_id:
             continue
         try:
             s = load_json(path)
@@ -386,25 +481,27 @@ def previous_titles(exclude: Path, limit: int = 40) -> list[str]:
     return titles
 
 
-def write_script(topic: str, minutes: float, previous: list[str]) -> dict:
+def write_script(topic: str, minutes: float, previous: list[str], channel: dict | None = None) -> dict:
+    channel = channel or get_channel()
     words = int(minutes * WORDS_PER_MINUTE)
     avoid = ""
     if previous:
         avoid = ("\n\nVideos this channel has already published. Find a fresh angle and do not reuse "
                  "their titles, hooks or phrasing:\n" + "\n".join(f"- {t}" for t in previous))
+    tips = f"\nChannel guidance for visuals: {channel['visuals']}" if channel.get("visuals") else ""
     prompt = f"""Write a YouTube video script about: {topic}
 
 Target length: about {words} words of narration (roughly {minutes:g} minutes).
 
 Split the narration into scenes of 1-3 sentences each (about 15-45 words). For every scene choose ONE visual source:
 - "nasa": NASA image library. Best for planets, moons, the Sun, stars, galaxies, nebulae, spacecraft, rockets, astronauts and Earth seen from orbit.
-- "stock_video": stock footage. Best for things on Earth: oceans, volcanoes, storms, lightning, forests, glaciers, deserts, night skies, laboratories.
-- "stock_photo": stock photo, when a still image of an Earth subject fits better.
+- "stock_video": stock footage. Best for the real world today: nature, oceans, weather, cities, people, animals, technology, everyday life.
+- "stock_photo": stock photo, when a still image fits better.
 - "archive": historical photos, artworks, documents and museum objects (Wikimedia Commons, Openverse, the Smithsonian). Best for history, famous people, real places, inventions and artefacts.
-The query must be 2-5 concrete, searchable words describing what is visible (e.g. "Jupiter Great Red Spot", "lava flow ocean", "aurora night sky"). Never abstract ideas.
+The query must be 2-5 concrete, searchable English words describing what is visible (e.g. "Jupiter Great Red Spot", "lava flow ocean", "aurora night sky"). Never abstract ideas.{tips}
 
 Also give a YouTube title (max 90 characters, curiosity-driven but accurate), a description of 2-3 short paragraphs, 10 to 15 short tags, and 2-5 punchy words of thumbnail text.{avoid}"""
-    script = claude_json(ANTHROPIC_MODEL, WRITER_SYSTEM, prompt, Script).model_dump()
+    script = claude_json(ANTHROPIC_MODEL, writer_system(channel), prompt, Script).model_dump()
     if not script["scenes"]:
         raise ValueError("Claude returned a script with no scenes")
     script["topic"] = topic
@@ -523,10 +620,14 @@ def keyword_query(text: str, fallback: str) -> str:
     return " ".join(w for w in dict.fromkeys(candidates) if w in best) or fallback[:100]
 
 
-def plan_visuals(title: str, narrations: list[str]) -> dict:
+def plan_visuals(title: str, narrations: list[str], channel: dict | None = None) -> dict:
     """Claude chooses a visual for each scene and writes the description, tags and thumbnail text."""
+    channel = channel or get_channel()
     numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(narrations))
-    prompt = f"""Video title: {title}
+    tips = f"\nChannel guidance for visuals: {channel['visuals']}" if channel.get("visuals") else ""
+    language = LANGUAGES.get(channel.get("language") or "en", "English")
+    prompt = f"""This video is for a YouTube channel about {channel['about']}.
+Video title: {title}
 
 Narration, numbered from 0, one scene per line:
 {numbered}
@@ -536,13 +637,13 @@ For every scene, in order, choose ONE visual source:
 - "stock_video": stock footage. The best choice for almost everything else: people, places, cities, nature, animals, history, technology, everyday life.
 - "stock_photo": stock photo, when a still image fits better (objects, portraits, modern places).
 - "archive": historical photos, artworks, documents and museum objects (Wikimedia Commons, Openverse, the Smithsonian). Best for history, famous people, real named places, inventions and artefacts.
-The query must be 2-5 concrete, searchable words describing what is visible on screen (e.g. "busy city street night", "old printing press", "lava flow ocean"). Never abstract ideas, never names of people who are not famous.
+The query must be 2-5 concrete, searchable English words describing what is visible on screen (e.g. "busy city street night", "old printing press", "lava flow ocean"). Never abstract ideas, never names of people who are not famous.{tips}
 
-Return exactly {len(narrations)} visuals. Also write a YouTube description of 2-3 short paragraphs, 10 to 15 short tags and 2-5 punchy words of thumbnail text."""
+Return exactly {len(narrations)} visuals. Also write, in {language}, a YouTube description of 2-3 short paragraphs, 10 to 15 short tags and 2-5 punchy words of thumbnail text."""
     return claude_json(ANTHROPIC_MODEL, PLANNER_SYSTEM, prompt, VisualPlan).model_dump()
 
 
-def script_from_text(title: str, text: str, suggest: bool = True) -> dict:
+def script_from_text(title: str, text: str, suggest: bool = True, channel: dict | None = None) -> dict:
     """A script from your own narration. With suggest=True, Claude fills in the visuals you did not choose,
     the description, tags and thumbnail text; the narration is never changed."""
     scenes = parse_manual_script(text)
@@ -552,7 +653,7 @@ def script_from_text(title: str, text: str, suggest: bool = True) -> dict:
               "scenes": scenes}
     if suggest:
         log("Claude is choosing visuals and writing the description and tags (your narration stays as written)")
-        plan = plan_visuals(script["title"], [s["narration"] for s in scenes])
+        plan = plan_visuals(script["title"], [s["narration"] for s in scenes], channel=channel)
         for scene, visual in zip(scenes, plan.get("visuals") or []):
             if not scene["visual"]["query"] and visual.get("query"):
                 scene["visual"] = {"source": visual["source"], "query": visual["query"][:100]}
@@ -564,10 +665,11 @@ def script_from_text(title: str, text: str, suggest: bool = True) -> dict:
     return script
 
 
-def fact_check(script: dict, project: Path) -> dict:
+def fact_check(script: dict, project: Path, channel: dict | None = None) -> dict:
     """Two passes: research with web search (free text), then convert the notes to structured data."""
+    channel = channel or project_channel(project)
     numbered = "\n".join(f"{i}. {s['narration']}" for i, s in enumerate(script["scenes"]))
-    notes_prompt = f"""Fact-check this science video narration. Scenes are numbered from 0.
+    notes_prompt = f"""Fact-check this video narration. Scenes are numbered from 0.
 
 {numbered}
 
@@ -575,7 +677,7 @@ Write your findings as notes with two sections:
 1. Issues: for each factual error, outdated figure or misleading simplification give the scene number, what is wrong, the full corrected narration for that scene, and the URL of the source you used.
 2. Claims to verify: specific numbers or claims a human should double-check against a primary source, each with the source you consulted, if any.
 If the narration is sound, say "No issues found" and still list the claims worth verifying."""
-    notes, searches = claude_research(FACTCHECK_MODEL, FACTCHECK_SYSTEM, notes_prompt, FACTCHECK_SEARCHES)
+    notes, searches = claude_research(FACTCHECK_MODEL, factcheck_system(channel), notes_prompt, FACTCHECK_SEARCHES)
     (project / "factcheck_notes.md").write_text(notes, encoding="utf-8")
     log(f"Fact-checker ran {searches} web search(es)")
 
@@ -634,7 +736,8 @@ def write_review(project: Path, script: dict, check: dict) -> Path:
 # ----------------------------------------------------------------------------
 # Step 2: voiceover (ElevenLabs), one file per scene so visuals line up exactly
 # ----------------------------------------------------------------------------
-def tts(text: str, mp3: Path, align_path: Path, prev_text: str = "", next_text: str = "") -> None:
+def tts(text: str, mp3: Path, align_path: Path, prev_text: str = "", next_text: str = "",
+        voice_id: str | None = None) -> None:
     body = {
         "text": text,
         "model_id": ELEVENLABS_MODEL,
@@ -649,7 +752,7 @@ def tts(text: str, mp3: Path, align_path: Path, prev_text: str = "", next_text: 
         body["next_text"] = next_text
     # The with-timestamps variant costs the same and returns per-character timing for exact captions.
     r = HTTP.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/with-timestamps",
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id or ELEVENLABS_VOICE_ID}/with-timestamps",
         params={"output_format": "mp3_44100_128"},
         headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
         json=body,
@@ -689,9 +792,11 @@ def make_voiceover(project: Path, script: dict) -> list[dict]:
     files = [audio_files(project, i) for i in range(len(scenes))]
     # Regenerate a clip only if the narration was edited since the last run.
     todo = voiceover_todo(project, script)
+    voice_id = None
     if todo:
         chars = sum(len(scenes[i]["narration"].strip()) for i in todo)
         log(f"Voiceover: {len(todo)} scene(s) to synthesize, {chars} characters")
+        voice_id = project_channel(project).get("voice_id") or None   # a channel can have its own voice
     timeline = []
     for i, (scene, f) in enumerate(zip(scenes, files)):
         text = scene["narration"].strip()
@@ -699,7 +804,10 @@ def make_voiceover(project: Path, script: dict) -> list[dict]:
             log(f"Voiceover {i + 1}/{len(scenes)}")
             prev_text = scenes[i - 1]["narration"] if i > 0 else ""
             next_text = scenes[i + 1]["narration"] if i + 1 < len(scenes) else ""
-            tts(text, f["mp3"], f["json"], prev_text, next_text)
+            if voice_id:
+                tts(text, f["mp3"], f["json"], prev_text, next_text, voice_id=voice_id)
+            else:
+                tts(text, f["mp3"], f["json"], prev_text, next_text)
             f["txt"].write_text(text, encoding="utf-8")
             f["wav"].unlink(missing_ok=True)
         speech = media_duration(f["mp3"])
@@ -1992,6 +2100,11 @@ def project_music(project: Path, save: bool = True) -> Path | None:
             return track
         if save:
             log(f"Note: this video's music track {choice} is no longer in {music_library()}; using the default")
+    channel_music = get_channel(meta.get("channel")).get("music")   # a channel can set its own track (or none)
+    if channel_music == "none":
+        return None
+    if channel_music and (music_library() / channel_music).is_file():
+        return music_library() / channel_music
     if MUSIC_PATH and MUSIC_PATH.is_file():
         return MUSIC_PATH
     if not rotating:
@@ -2506,18 +2619,24 @@ def upload_file(youtube, path: Path, body: dict) -> str:
     return response["id"]
 
 
+def video_language(project: Path) -> str:
+    """The language a video is narrated in: its own (a translated version) or its channel's."""
+    return load_meta(project).get("language") or project_channel(project).get("language") or "en"
+
+
 def upload(project: Path, script: dict, assets: list[dict], args) -> str:
     from googleapiclient.http import MediaFileUpload
     youtube = get_youtube(interactive=not args.yes)
+    language = video_language(project)
     body = {
         "snippet": {
             "title": clean_text(script["title"])[:100],
             "description": build_description(script, assets, load_json(project / "timeline.json")
                                              if (project / "timeline.json").exists() else None),
             "tags": trim_tags(script.get("tags", [])),
-            "categoryId": "28",  # Science & Technology
-            "defaultLanguage": "en",
-            "defaultAudioLanguage": "en",
+            "categoryId": project_channel(project).get("category") or "28",
+            "defaultLanguage": language,
+            "defaultAudioLanguage": language,
         },
         "status": upload_status(args, assets),
     }
@@ -2535,7 +2654,8 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
     try:
         youtube.captions().insert(
             part="snippet",
-            body={"snippet": {"videoId": video_id, "language": "en", "name": "English", "isDraft": False}},
+            body={"snippet": {"videoId": video_id, "language": language, "name": LANGUAGES.get(language, language),
+                              "isDraft": False}},
             media_body=MediaFileUpload(str(project / "captions.srt"), mimetype="application/octet-stream"),
         ).execute()
         log("Captions uploaded")
@@ -2558,9 +2678,11 @@ def upload_short(project: Path, script: dict, assets: list[dict], args) -> str:
     if credits:
         desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
     desc += "\n\nNarration uses an AI-generated voice."
+    language = video_language(project)
     body = {"snippet": {"title": title, "description": desc[:4900],
-                        "tags": trim_tags(list(script.get("tags", [])) + ["Shorts"]), "categoryId": "28",
-                        "defaultLanguage": "en", "defaultAudioLanguage": "en"},
+                        "tags": trim_tags(list(script.get("tags", [])) + ["Shorts"]),
+                        "categoryId": project_channel(project).get("category") or "28",
+                        "defaultLanguage": language, "defaultAudioLanguage": language},
             "status": upload_status(args, assets[s["first"]:s["last"] + 1])}
     log("Uploading the Short to YouTube...")
     video_id = upload_file(youtube, project / "short" / "short.mp4", body)
@@ -2715,19 +2837,22 @@ def preflight(upload_enabled: bool, unattended: bool) -> None:
 def create_script(project: Path, topic: str | None, args) -> dict:
     """Write the script (or take yours from --script-file), fact-check it and save it with review notes."""
     script_file = getattr(args, "script_file", None)
+    channel = get_channel(getattr(args, "channel", None) or load_meta(project).get("channel"))
+    meta = dict(load_meta(project), channel=channel["id"])
     if script_file:
         if not topic:
             sys.exit("--script-file needs a title: add --title \"Your video title\"")
-        log(f"Using your script from {script_file}")
-        script = script_from_text(topic, Path(script_file).read_text(encoding="utf-8"), suggest=True)
-        save_meta(project, dict(load_meta(project), topic=topic, source="manual", created=datetime.now().isoformat()))
+        log(f"Using your script from {script_file} (channel: {channel['name']})")
+        script = script_from_text(topic, Path(script_file).read_text(encoding="utf-8"), suggest=True, channel=channel)
+        save_meta(project, dict(meta, topic=topic, source="manual", created=datetime.now().isoformat()))
     else:
         if not topic:
             sys.exit("No script.json in this project and no topic given.")
-        log(f"Writing script: {topic}")
-        script = write_script(topic, args.minutes, previous_titles(project))
+        log(f"Writing script: {topic} (channel: {channel['name']})")
+        save_meta(project, dict(meta, topic=meta.get("topic") or topic))
+        script = write_script(topic, args.minutes, previous_titles(project, channel_id=channel["id"]), channel=channel)
     log("Fact-checking")
-    check = fact_check(script, project)
+    check = fact_check(script, project, channel=channel)
     save_json(project / "factcheck.json", check)
     if args.yes:
         n = apply_fixes(script, check)
@@ -2844,6 +2969,7 @@ def main() -> None:
     p.add_argument("--script-file", type=Path,
                    help="Use your own narration from a text file (blank lines separate scenes) instead of writing one")
     p.add_argument("--title", help="Video title, used with --script-file")
+    p.add_argument("--channel", help="Channel id from channels.json (default: the default channel)")
     p.add_argument("--yes", action="store_true", help="Unattended: auto-apply fact-check fixes, skip review pause")
     p.add_argument("--no-upload", action="store_true", help="Build the video but don't upload")
     p.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
@@ -2857,6 +2983,9 @@ def main() -> None:
         youtube_credentials(interactive=True, force=True)
         log(f"YouTube login saved to {YT_TOKEN}")
         return
+    if args.channel and args.channel not in {c["id"] for c in load_channels()["channels"]}:
+        p.error(f"Unknown channel '{args.channel}'; channels: "
+                f"{', '.join(c['id'] for c in load_channels()['channels'])}")
     preflight(upload_enabled=not args.no_upload, unattended=args.yes)
 
     if args.topics_file:

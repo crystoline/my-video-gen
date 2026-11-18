@@ -33,6 +33,7 @@ TEST_ENV = {
     "ANTHROPIC_API_KEY": "test-not-a-real-key", "ELEVENLABS_API_KEY": "test-not-a-real-key",
     "ELEVENLABS_VOICE_ID": "test-voice",
     "YT_CLIENT_SECRETS": str(TMP / "client_secret.json"), "YT_TOKEN": str(TMP / "youtube_token.json"),
+    "CHANNELS_FILE": str(TMP / "channels.json"),
 }
 os.environ.update(TEST_ENV)
 sys.path.insert(0, str(ROOT))

@@ -37,7 +37,7 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
-SOURCES = ("nasa", "stock_video", "stock_photo")
+SOURCES = ("nasa", "stock_video", "stock_photo", "archive", "ai")
 MANUAL_TEXT = "my_script.txt"   # narration pasted in "I have the script", as typed
 
 app = Flask(__name__, static_folder=None)
@@ -1047,11 +1047,23 @@ def api_requeue():
 # ----------------------------------------------------------------------------
 # Routes: settings and status
 # ----------------------------------------------------------------------------
-SETTINGS = {   # .env name -> kind; only sound, voice and video settings are editable here, never keys
+SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings are editable here, never keys
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float",
+    "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool",
 }
+
+
+def providers_status() -> list[dict]:
+    """Every visual provider: on or off (in the configured order, then the ones that are off) and its key."""
+    labels = {"stock_video": "stock video", "stock_photo": "stock photos", "archive": "archive & museums",
+              "nasa": "NASA images"}
+    order = [p for p in pl.VISUAL_PROVIDERS if p in pl.PROVIDERS] + [p for p in pl.PROVIDERS if p not in pl.VISUAL_PROVIDERS]
+    return [{"id": pid, "name": pl.PROVIDERS[pid]["name"], "about": pl.PROVIDERS[pid]["about"],
+             "kinds": [labels[k] for k in pl.PROVIDERS[pid]["kinds"]], "key": pl.PROVIDERS[pid]["key"],
+             "key_set": not pl.PROVIDERS[pid]["key"] or bool(getattr(pl, pl.PROVIDERS[pid]["key"], "")),
+             "enabled": pid in pl.VISUAL_PROVIDERS, "ready": pl.provider_ready(pid)} for pid in order]
 
 
 def current_settings() -> dict:
@@ -1065,7 +1077,8 @@ def current_settings() -> dict:
             "VOICE_TONE": pl.VOICE_TONE, "VOICE_STABILITY": pl.VOICE_STABILITY,
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
-            "CROSSFADE": pl.CROSSFADE}
+            "CROSSFADE": pl.CROSSFADE, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
+            "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE}
 
 
 def write_env(updates: dict[str, str]) -> None:
@@ -1176,7 +1189,7 @@ def api_status():
         "settings": current_settings(), "music_files": music_files, "music_library": music["library"],
         "voice_tones": list(pl.VOICE_TONES),
         "problems": pl.settings_problems(), "projects_dir": str(pl.PROJECTS_DIR),
-        "stock_providers": pl.stock_providers(),
+        "stock_providers": pl.stock_providers(), "providers": providers_status(),
     })
 
 
@@ -1197,6 +1210,14 @@ def api_save_settings():
                 raise ValueError(f"{key} must be a number")
         elif kind == "choice":
             updates[key] = str(value).strip().lower()
+        elif kind == "providers":
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"{key} must be a list of provider names")
+            names = list(dict.fromkeys(v.strip().lower() for v in value if v.strip()))
+            unknown = [v for v in names if v not in pl.PROVIDERS]
+            if unknown:
+                raise ValueError(f"Unknown visual provider(s): {', '.join(unknown)}")
+            updates[key] = ",".join(names) or "none"
         else:   # path: a file or folder inside the MyVideoGen folder, or empty for none
             value = str(value or "").strip().rstrip("/")
             if value:

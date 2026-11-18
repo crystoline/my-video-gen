@@ -7,7 +7,8 @@ const S = {
   slug: null, project: null, draft: null, dirty: false, tab: "script",
   job: null, jobLines: [], logJobId: null, activitySig: "",
 };
-const SOURCES = { nasa: "NASA images", stock_video: "Stock video", stock_photo: "Stock photo" };
+const SOURCES = { nasa: "NASA images", stock_video: "Stock video", stock_photo: "Stock photo",
+  archive: "Archive & museums", ai: "AI-generated" };
 const STEP_LABELS = {
   empty: "Not started", writing: "Writing script", review: "Needs review", voiceover: "Needs voiceover",
   visuals: "Needs visuals", render: "Ready to render", upload: "Ready to upload", uploaded: "Uploaded",
@@ -1031,8 +1032,33 @@ function renderSettings(voiced) {
       h("p", { class: "muted small" }, "These only affect narration generated after you save. To hear them on an existing scene, use Re-voice on the Script tab (it costs that scene's characters).")),
     h("div", { class: "panel stack" }, h("h2", {}, "Video"),
       h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1))),
+    providersPanel(vals),
     h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { if (await save()) renderSettings(voiced); } }, "Save settings")),
     statusPanel(st));
+}
+
+// Visual providers: switch on/off and order (first = tried first). Keys stay in .env.
+function providersPanel(vals) {
+  const list = (S.status.providers || []).map(p => Object.assign({}, p));
+  const box = h("div", {});
+  const sync = () => { vals.VISUAL_PROVIDERS = list.filter(p => p.enabled).map(p => p.id); };
+  const draw = () => {
+    box.replaceChildren(...list.map((p, i) => h("div", { class: "queue-item" },
+      h("input", { type: "checkbox", checked: p.enabled, onchange: e => { p.enabled = e.target.checked; sync(); draw(); } }),
+      h("span", { class: "t" }, h("strong", {}, p.name), " ", h("span", { class: "muted small" }, `${p.about} · ${p.kinds.join(", ")}`),
+        h("div", { class: "small" }, !p.key ? chip("no key needed", "ok") : p.key_set ? chip(`${p.key} set`, "ok")
+          : chip(`add ${p.key} to .env`, p.enabled ? "warn" : ""))),
+      h("button", { class: "small", disabled: i === 0, title: "Try earlier", onclick: () => { [list[i - 1], list[i]] = [list[i], list[i - 1]]; sync(); draw(); } }, "↑"),
+      h("button", { class: "small", disabled: i === list.length - 1, title: "Try later", onclick: () => { [list[i + 1], list[i]] = [list[i], list[i + 1]]; sync(); draw(); } }, "↓"))));
+  };
+  draw();
+  return h("div", { class: "panel stack" }, h("h2", {}, "Visual sources"),
+    h("p", { class: "muted small" }, "Ticked sources are searched in this order when a scene's visual is fetched automatically; the picker shows results from all of them. ",
+      "Providers that need a key are skipped until the key is in .env (restart the web UI after adding one)."),
+    box,
+    h("label", { class: "row" }, h("input", { type: "checkbox", checked: vals.ALLOW_SHARE_ALIKE, onchange: e => { vals.ALLOW_SHARE_ALIKE = e.target.checked; } }),
+      h("span", { style: "margin:0" }, "Also use CC BY-SA (share-alike) images and footage from Wikimedia Commons and Openverse. ",
+        h("span", { class: "muted small" }, "Many more results, but share-alike can require your video to carry the same licence. Public domain, CC0 and CC BY are always allowed; everything is credited in the description."))));
 }
 
 function musicLibraryPanel(voiced) {

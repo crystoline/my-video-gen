@@ -64,10 +64,11 @@ def http(monkeypatch):
 
 
 def test_schema_prompt_and_searchers_use_generic_stock_names():
-    assert set(pl.Visual.model_json_schema()["properties"]["source"]["enum"]) == {"nasa", "stock_video", "stock_photo"}
+    sources = {"nasa", "stock_video", "stock_photo", "archive"}
+    assert set(pl.Visual.model_json_schema()["properties"]["source"]["enum"]) == sources
     src = inspect.getsource(pl.write_script)
-    assert '"stock_video"' in src and '"stock_photo"' in src and "pexels" not in src.lower()
-    assert set(pl.SEARCHERS) == {"nasa", "stock_video", "stock_photo"}
+    assert '"stock_video"' in src and '"archive"' in src and "pexels" not in src.lower()
+    assert set(pl.SEARCHERS) == sources
 
 
 def test_pixabay_video_picks_the_1080p_file_of_the_first_long_enough_unused_clip(http, monkeypatch):
@@ -160,6 +161,10 @@ def test_a_pixabay_page_past_the_last_result_is_just_empty(http, monkeypatch):
 
 
 def test_search_candidates_interleaves_providers_and_reports_failures(monkeypatch):
+    monkeypatch.setattr(pl, "PEXELS_API_KEY", "k")
+    monkeypatch.setattr(pl, "PIXABAY_API_KEY", "k")
+    monkeypatch.setattr(pl, "VISUAL_PROVIDERS", ["pexels", "pixabay"])
+
     def mk(prefix, n):
         return lambda q, per_page, page: [{"id": f"{prefix}{k}", "kind": "video"} for k in range(n)]
 
@@ -195,6 +200,7 @@ def test_nasa_candidates_show_a_preview_and_look_up_the_large_image_when_used(ht
 
 
 def test_without_stock_keys_scenes_fall_back_to_nasa(http, monkeypatch):
+    monkeypatch.setattr(pl, "VISUAL_PROVIDERS", ["pexels", "pixabay", "nasa"])
     fake = http({})
     nasa = lambda q, used, min_seconds=0: {"kind": "image", "url": "https://nasa/x.jpg", "id": "nasa:x", "credit": "NASA"}
     monkeypatch.setitem(pl.SEARCHERS, "nasa", nasa)

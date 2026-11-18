@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import html
 import itertools
 import json
 import math
@@ -72,11 +73,15 @@ VOICE_TONES = {
 }
 
 
+DEFAULT_PROVIDERS = "pexels,pixabay,unsplash,wikimedia,openverse,smithsonian,nasa"
+
+
 def configure() -> None:
     """Read settings from the environment (.env). Called at import, and again by the web UI after it saves settings."""
     global ANTHROPIC_MODEL, FACTCHECK_MODEL, FACTCHECK_SEARCHES, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
     global ELEVENLABS_MODEL, VOICE_STABILITY, VOICE_SIMILARITY, VOICE_STYLE, VOICE_SPEAKER_BOOST, VOICE_SPEED
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
+    global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE
     global RENDER_JOBS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
@@ -93,6 +98,12 @@ def configure() -> None:
     VOICE_TONE = os.getenv("VOICE_TONE", "soft").strip().lower() or "soft"
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
     PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+    UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+    SMITHSONIAN_API_KEY = os.getenv("SMITHSONIAN_API_KEY", "")
+    # Visual providers that are switched on, in the order they are tried (Settings in the web UI)
+    VISUAL_PROVIDERS = [p.strip().lower() for p in (os.getenv("VISUAL_PROVIDERS") or DEFAULT_PROVIDERS).split(",")
+                        if p.strip() and p.strip().lower() != "none"]
+    ALLOW_SHARE_ALIKE = _flag("ALLOW_SHARE_ALIKE", False)
     MUSIC_PATH = _path("MUSIC_PATH", "") if os.getenv("MUSIC_PATH") else None
     MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
     MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
@@ -203,7 +214,7 @@ def make_session() -> requests.Session:
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
     session.mount("http://", HTTPAdapter(max_retries=retry))
-    session.headers["User-Agent"] = "science-video-pipeline/1.1"
+    session.headers["User-Agent"] = "MyVideoGen/1.2 (self-hosted video tool)"   # Wikimedia asks for a descriptive one
     return session
 
 
@@ -225,7 +236,7 @@ def download(url: str, dest: Path) -> None:
 # ----------------------------------------------------------------------------
 class Visual(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: Literal["nasa", "stock_video", "stock_photo"] = Field(
+    source: Literal["nasa", "stock_video", "stock_photo", "archive"] = Field(
         description="Where to look for this scene's visual")
     query: str = Field(description="2-5 concrete, searchable words describing what is visible, "
                                    "e.g. 'Jupiter Great Red Spot' or 'aurora night sky'. Never abstract ideas.")
@@ -373,6 +384,7 @@ Split the narration into scenes of 1-3 sentences each (about 15-45 words). For e
 - "nasa": NASA image library. Best for planets, moons, the Sun, stars, galaxies, nebulae, spacecraft, rockets, astronauts and Earth seen from orbit.
 - "stock_video": stock footage. Best for things on Earth: oceans, volcanoes, storms, lightning, forests, glaciers, deserts, night skies, laboratories.
 - "stock_photo": stock photo, when a still image of an Earth subject fits better.
+- "archive": historical photos, artworks, documents and museum objects (Wikimedia Commons, Openverse, the Smithsonian). Best for history, famous people, real places, inventions and artefacts.
 The query must be 2-5 concrete, searchable words describing what is visible (e.g. "Jupiter Great Red Spot", "lava flow ocean", "aurora night sky"). Never abstract ideas.
 
 Also give a YouTube title (max 90 characters, curiosity-driven but accurate), a description of 2-3 short paragraphs, 10 to 15 short tags, and 2-5 punchy words of thumbnail text.{avoid}"""
@@ -506,7 +518,8 @@ Narration, numbered from 0, one scene per line:
 For every scene, in order, choose ONE visual source:
 - "nasa": NASA image library. Only for space: planets, moons, the Sun, stars, galaxies, spacecraft, rockets, astronauts, Earth from orbit.
 - "stock_video": stock footage. The best choice for almost everything else: people, places, cities, nature, animals, history, technology, everyday life.
-- "stock_photo": stock photo, when a still image fits better (objects, documents, portraits, old places).
+- "stock_photo": stock photo, when a still image fits better (objects, portraits, modern places).
+- "archive": historical photos, artworks, documents and museum objects (Wikimedia Commons, Openverse, the Smithsonian). Best for history, famous people, real named places, inventions and artefacts.
 The query must be 2-5 concrete, searchable words describing what is visible on screen (e.g. "busy city street night", "old printing press", "lava flow ocean"). Never abstract ideas, never names of people who are not famous.
 
 Return exactly {len(narrations)} visuals. Also write a YouTube description of 2-3 short paragraphs, 10 to 15 short tags and 2-5 punchy words of thumbnail text."""
@@ -712,7 +725,10 @@ def _first_unused(candidates: list[dict], used: set, min_seconds: float = 0):
     """The first result not used yet, preferring clips at least min_seconds long (the order is otherwise kept)."""
     fresh = [c for c in candidates if c["id"] not in used]
     fresh.sort(key=lambda c: c["kind"] == "video" and (c.get("duration") or 0) < min_seconds)
-    return {k: fresh[0][k] for k in ASSET_FIELDS} if fresh else None
+    if not fresh:
+        return None
+    # "track" is a URL some providers (Unsplash) ask to be called when a result is actually used
+    return {k: fresh[0][k] for k in (*ASSET_FIELDS, "track") if k in fresh[0]}
 
 
 def nasa_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
@@ -872,47 +888,242 @@ def pixabay_photo_search(query: str, used: set, min_seconds: float = 0):
     return _first_unused(pixabay_photo_candidates(query), used)
 
 
-# Stock providers in order of preference; each one is skipped when its key is not set.
-STOCK_VIDEO_PROVIDERS = [("pexels", pexels_video_search), ("pixabay", pixabay_video_search)]
-STOCK_PHOTO_PROVIDERS = [("pexels", pexels_photo_search), ("pixabay", pixabay_photo_search)]
+# --- Open archives: free to use, licence checked per file -------------------------------------------
+_OPEN_LICENSE = re.compile(r"^(public domain|pd([- ].*)?|no restrictions|cc0( 1\.0)?|cc[ -]by( \d\.\d)?)$", re.I)
+_SHARE_ALIKE = re.compile(r"^cc[ -]by[ -]sa( \d\.\d)?$", re.I)
 
 
-def _stock_search(providers, query: str, used: set, min_seconds: float):
-    """Try each stock provider in turn, so one provider failing never hides the others."""
-    for name, search in providers:
+def license_ok(name: str) -> bool:
+    """Public domain, CC0 and CC BY are fine for a monetised video. CC BY-SA only when ALLOW_SHARE_ALIKE is on,
+    because share-alike can require the video itself to carry the same licence."""
+    name = " ".join((name or "").split())
+    return bool(_OPEN_LICENSE.match(name) or (ALLOW_SHARE_ALIKE and _SHARE_ALIKE.match(name)))
+
+
+def _strip_html(s) -> str:
+    return " ".join(re.sub(r"<[^>]+>", " ", html.unescape(s or "")).split())
+
+
+def _commons_files(query: str, filetype: str, per_page: int, page: int) -> list[dict]:
+    r = HTTP.get("https://commons.wikimedia.org/w/api.php", timeout=HTTP_TIMEOUT, params={
+        "action": "query", "format": "json", "formatversion": 2, "generator": "search", "gsrnamespace": 6,
+        "gsrsearch": f"{query[:200]} filetype:{filetype}", "gsrlimit": per_page, "gsroffset": (page - 1) * per_page,
+        "prop": "imageinfo", "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 1920,
+        "iiextmetadatafilter": "LicenseShortName|Artist|ObjectName"})
+    r.raise_for_status()
+    pages = r.json().get("query", {}).get("pages", [])
+    out = []
+    for p in sorted(pages, key=lambda p: p.get("index", 0)):
+        info = (p.get("imageinfo") or [{}])[0]
+        meta = info.get("extmetadata") or {}
+        lic = (meta.get("LicenseShortName") or {}).get("value", "")
+        if not info.get("url") or not license_ok(lic):
+            continue
+        title = _strip_html((meta.get("ObjectName") or {}).get("value")) or Path(p.get("title", "")).stem.removeprefix("File:")
+        artist = _strip_html((meta.get("Artist") or {}).get("value")) or "unknown author"
+        credit = f"{title} by {artist} ({lic}), via Wikimedia Commons: {info.get('descriptionurl', '')}"
+        out.append({"info": info, "pageid": p.get("pageid"), "title": title, "credit": credit[:400], "license": lic})
+    return out
+
+
+def commons_image_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    out = []
+    for f in _commons_files(query, "bitmap", per_page, page):
+        info = f["info"]
+        w, h = info.get("width") or 0, info.get("height") or 0
+        if info.get("mime") not in ("image/jpeg", "image/png", "image/webp") or w < 1000 or w < h:
+            continue
+        full = info.get("thumburl") or info["url"]   # at most 1920 px wide
+        thumb = full.replace("/1920px-", "/640px-") if "/1920px-" in full else full
+        out.append({"kind": "image", "url": full, "id": f"commons:{f['pageid']}", "credit": f["credit"], "thumb": thumb,
+                    "width": w, "height": h, "title": f["title"], "provider": "Wikimedia Commons",
+                    "source": "archive", "license": f["license"]})
+    return out
+
+
+def commons_video_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    out = []
+    for f in _commons_files(query, "video", per_page, page):
+        info = f["info"]
+        w, h = info.get("width") or 0, info.get("height") or 0
+        if (info.get("mime") not in ("video/webm", "video/ogg", "video/mp4") or w < 1280 or w < h
+                or (info.get("size") or 0) > 300 * 1024 ** 2):
+            continue
+        out.append({"kind": "video", "url": info["url"], "id": f"commons:{f['pageid']}", "credit": f["credit"],
+                    "thumb": info.get("thumburl"), "duration": round(info.get("duration") or 0) or None,
+                    "width": w, "height": h, "title": f["title"], "provider": "Wikimedia Commons",
+                    "source": "stock_video", "license": f["license"]})
+    return out
+
+
+def openverse_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    """Openly licensed images from Flickr, museums and others. Anonymous use allows 20 searches a minute."""
+    r = HTTP.get("https://api.openverse.org/v1/images/", timeout=HTTP_TIMEOUT,
+                 params={"q": query[:200], "license_type": "commercial,modification", "page_size": per_page,
+                         "page": page, "mature": "false"})
+    if page > 1 and getattr(r, "status_code", 200) in (400, 404):   # past the last page
+        return []
+    r.raise_for_status()
+    out = []
+    for x in r.json().get("results", []):
+        code = (x.get("license") or "").lower()
+        lic = {"cc0": "CC0", "pdm": "Public domain"}.get(code, f"CC {code.upper()} {x.get('license_version') or ''}".strip())
+        w, h = x.get("width") or 0, x.get("height") or 0
+        if x.get("mature") or not x.get("url") or not license_ok(lic) or (w and w < 1000) or (w and h and w < h):
+            continue
+        credit = x.get("attribution") or f"{x.get('title') or 'Image'} by {x.get('creator') or 'unknown'} ({lic})"
+        out.append({"kind": "image", "url": x["url"], "id": f"openverse:{x['id']}", "credit": credit[:400],
+                    "thumb": x.get("thumbnail") or x["url"], "width": w or None, "height": h or None,
+                    "title": x.get("title") or "", "provider": f"Openverse ({x.get('source') or x.get('provider')})",
+                    "source": "archive", "license": lic})
+    return out
+
+
+def _si_sized(media: dict, size: int) -> str:
+    """A Smithsonian image URL at most `size` px, following the pattern of its own thumbnail URL."""
+    content, thumb = media.get("content") or "", media.get("thumbnail") or ""
+    if content and thumb.startswith(content):
+        tail = thumb[len(content):]
+        sized = re.sub(r"\d+$", str(size), tail)
+        if sized != tail:
+            return content + sized
+    return content
+
+
+def smithsonian_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    """CC0 (public domain) images from the Smithsonian's museums. Needs a free key from api.data.gov."""
+    if not SMITHSONIAN_API_KEY:
+        return []
+    r = HTTP.get("https://api.si.edu/openaccess/api/v1.0/search", timeout=HTTP_TIMEOUT,
+                 params={"q": f'{query[:200]} AND online_media_type:"Images" AND media_usage:"CC0"',
+                         "rows": per_page, "start": (page - 1) * per_page, "api_key": SMITHSONIAN_API_KEY})
+    r.raise_for_status()
+    out = []
+    for row in r.json().get("response", {}).get("rows", []):
+        dnr = (row.get("content") or {}).get("descriptiveNonRepeating") or {}
+        media = ((dnr.get("online_media") or {}).get("media")) or []
+        m = next((m for m in media if m.get("type") == "Images" and (m.get("usage") or {}).get("access") == "CC0"
+                  and m.get("content")), None)
+        if not m:
+            continue
+        w, h = m.get("width") or 0, m.get("height") or 0
+        if w and h and w < h:
+            continue
+        title = _strip_html(row.get("title")) or "Smithsonian collection object"
+        museum = dnr.get("data_source") or "Smithsonian Institution"
+        out.append({"kind": "image", "url": _si_sized(m, 1920), "id": f"si:{m.get('id') or row.get('id')}",
+                    "credit": f"{title} ({museum}, Smithsonian Open Access, CC0)"[:400],
+                    "thumb": _si_sized(m, 640), "width": w or None, "height": h or None, "title": title,
+                    "provider": "Smithsonian", "source": "archive", "license": "CC0"})
+    return out
+
+
+def unsplash_candidates(query: str, per_page: int = PER_PAGE, page: int = 1) -> list[dict]:
+    """Unsplash photos. Its API rules: credit the photographer and report each photo you actually use."""
+    if not UNSPLASH_ACCESS_KEY:
+        return []
+    r = HTTP.get("https://api.unsplash.com/search/photos", timeout=HTTP_TIMEOUT,
+                 headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}", "Accept-Version": "v1"},
+                 params={"query": query[:200], "orientation": "landscape", "per_page": per_page, "page": page,
+                         "content_filter": "high"})
+    r.raise_for_status()
+    out = []
+    for p in r.json().get("results", []):
+        urls = p.get("urls") or {}
+        if not urls.get("raw"):
+            continue
+        name = (p.get("user") or {}).get("name") or "an Unsplash photographer"
+        sep = "&" if "?" in urls["raw"] else "?"
+        out.append({"kind": "image", "url": f"{urls['raw']}{sep}w=1920&fm=jpg&q=85", "id": f"unsplash:{p['id']}",
+                    "credit": f"Photo by {name} on Unsplash", "thumb": urls.get("small") or urls.get("thumb"),
+                    "width": p.get("width"), "height": p.get("height"), "title": p.get("alt_description") or "",
+                    "provider": "Unsplash", "source": "stock_photo",
+                    "track": (p.get("links") or {}).get("download_location")})
+    return out
+
+
+def report_use(asset: dict) -> None:
+    """Tell a provider its result was used, where its API rules ask for that (Unsplash)."""
+    url = asset.pop("track", None)
+    if url and UNSPLASH_ACCESS_KEY and url.startswith("https://api.unsplash.com/"):
         try:
-            result = search(query, used, min_seconds)
-        except requests.RequestException as e:
+            HTTP.get(url, headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}, timeout=20)
+        except requests.RequestException:
+            pass
+
+
+# --- Provider registry: which providers are on, in which order, and what each one can search -------
+PROVIDERS = {
+    "pexels": {"name": "Pexels", "key": "PEXELS_API_KEY", "about": "Stock video and photos",
+               "kinds": {"stock_video": "pexels_video_candidates", "stock_photo": "pexels_photo_candidates"}},
+    "pixabay": {"name": "Pixabay", "key": "PIXABAY_API_KEY", "about": "Stock video and photos",
+                "kinds": {"stock_video": "pixabay_video_candidates", "stock_photo": "pixabay_photo_candidates"}},
+    "unsplash": {"name": "Unsplash", "key": "UNSPLASH_ACCESS_KEY", "about": "High-quality photos",
+                 "kinds": {"stock_photo": "unsplash_candidates"}},
+    "wikimedia": {"name": "Wikimedia Commons", "key": None,
+                  "about": "History, people, places and documentary footage (free licences, credited)",
+                  "kinds": {"archive": "commons_image_candidates", "stock_video": "commons_video_candidates"}},
+    "openverse": {"name": "Openverse", "key": None, "about": "Openly licensed images from Flickr and museums",
+                  "kinds": {"archive": "openverse_candidates"}},
+    "smithsonian": {"name": "Smithsonian", "key": "SMITHSONIAN_API_KEY", "about": "Museum objects and art (CC0)",
+                    "kinds": {"archive": "smithsonian_candidates"}},
+    "nasa": {"name": "NASA", "key": None, "about": "Space, planets, missions",
+             "kinds": {"nasa": "nasa_candidates"}},
+}
+
+
+def provider_ready(pid: str) -> bool:
+    p = PROVIDERS.get(pid)
+    return bool(p) and pid in VISUAL_PROVIDERS and (not p["key"] or bool(globals().get(p["key"])))
+
+
+def providers_for(source: str) -> list[tuple[str, str]]:
+    """(name, function name) of the providers that are on and can search this source, in the configured order."""
+    return [(PROVIDERS[pid]["name"], PROVIDERS[pid]["kinds"][source]) for pid in VISUAL_PROVIDERS
+            if pid in PROVIDERS and source in PROVIDERS[pid]["kinds"] and provider_ready(pid)]
+
+
+def search_source(source: str, query: str, used: set, min_seconds: float = 0):
+    """The first unused result for one kind of source, trying each provider in turn so one failing never hides
+    the others."""
+    for name, fn in providers_for(source):
+        try:
+            found = nasa_search(query, used, min_seconds) if fn == "nasa_candidates" else \
+                _first_unused(globals()[fn](query), used, min_seconds)
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
             log(f"  {name} search failed for '{query}': {e}")
             continue
-        if result:
-            return result
+        if found:
+            return found
     return None
 
 
 def stock_video_search(query: str, used: set, min_seconds: float = 0):
-    return _stock_search(STOCK_VIDEO_PROVIDERS, query, used, min_seconds)
+    return search_source("stock_video", query, used, min_seconds)
 
 
 def stock_photo_search(query: str, used: set, min_seconds: float = 0):
-    return _stock_search(STOCK_PHOTO_PROVIDERS, query, used, min_seconds)
+    return search_source("stock_photo", query, used, min_seconds)
+
+
+def archive_search(query: str, used: set, min_seconds: float = 0):
+    return search_source("archive", query, used, min_seconds)
+
+
+def nasa_source_search(query: str, used: set, min_seconds: float = 0):
+    return search_source("nasa", query, used, min_seconds)
 
 
 def stock_providers() -> list[str]:
-    """Names of the stock-footage providers that have an API key configured."""
-    return [name for name, key in (("Pexels", PEXELS_API_KEY), ("Pixabay", PIXABAY_API_KEY)) if key]
-
-
-CANDIDATE_PROVIDERS = {
-    "nasa": [("NASA", "nasa_candidates")],
-    "stock_video": [("Pexels", "pexels_video_candidates"), ("Pixabay", "pixabay_video_candidates")],
-    "stock_photo": [("Pexels", "pexels_photo_candidates"), ("Pixabay", "pixabay_photo_candidates")],
-}
+    """Names of the stock-footage providers that are on and have an API key."""
+    return [PROVIDERS[p]["name"] for p in VISUAL_PROVIDERS if p in ("pexels", "pixabay", "unsplash") and provider_ready(p)]
 
 
 def search_candidates(source: str, query: str, page: int = 1) -> tuple[list[dict], list[str]]:
     """Every provider's results for one kind of source, interleaved, for the visual picker. Returns (results, errors)."""
-    providers = [(name, globals()[fn]) for name, fn in CANDIDATE_PROVIDERS[source]]
+    providers = [(name, globals()[fn]) for name, fn in providers_for(source)]
+    if not providers:
+        return [], []
     with ThreadPoolExecutor(max_workers=len(providers)) as pool:
         futures = [(name, pool.submit(fn, query, PER_PAGE, page)) for name, fn in providers]
     lists, errors = [], []
@@ -925,7 +1136,8 @@ def search_candidates(source: str, query: str, page: int = 1) -> tuple[list[dict
     return results, errors
 
 
-SEARCHERS = {"nasa": nasa_search, "stock_video": stock_video_search, "stock_photo": stock_photo_search}
+SEARCHERS = {"nasa": nasa_source_search, "stock_video": stock_video_search, "stock_photo": stock_photo_search,
+             "archive": archive_search}
 # Source names used by older script.json files
 SOURCE_ALIASES = {"pexels_video": "stock_video", "pexels_photo": "stock_photo",
                   "pixabay_video": "stock_video", "pixabay_photo": "stock_photo"}
@@ -988,10 +1200,23 @@ def gather_visuals(project: Path, script: dict, timeline: list[dict]) -> list[di
         if i < len(manifest) and manifest[i] and Path(manifest[i]["path"]).exists():
             continue
         log(f"Visual {i + 1}/{len(script['scenes'])}: {scene.get('visual', {}).get('query')}")
-        asset = find_visual(scene, used, timeline[i]["duration"])
-        store_asset(project, manifest, i, asset, download_from=asset["url"])
-        used.add(asset["id"])
+        fetch_into(project, manifest, i, scene, used, timeline[i]["duration"])
     return manifest[:len(script["scenes"])]
+
+
+def fetch_into(project: Path, manifest: list, i: int, scene: dict, used: set, min_seconds: float) -> dict:
+    """Find and download a visual for scene i, moving on to the next result if a download is broken."""
+    for attempt in range(3):
+        asset = find_visual(scene, used, min_seconds)
+        used.add(asset["id"])
+        try:
+            store_asset(project, manifest, i, asset, download_from=asset["url"])
+            return asset
+        except (RuntimeError, requests.RequestException) as e:
+            if attempt == 2:
+                raise
+            log(f"  {str(e)[:200]}; trying the next result")
+    raise RuntimeError("unreachable")
 
 
 def store_asset(project: Path, manifest: list, i: int, asset: dict, download_from: str | None = None,
@@ -1001,11 +1226,20 @@ def store_asset(project: Path, manifest: list, i: int, asset: dict, download_fro
     asset_dir.mkdir(exist_ok=True)
     source = download_from or str(copy_from)
     suffix = Path(urlparse(source).path if download_from else source).suffix.lower()
-    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv"):
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv", ".ogv"):
         suffix = ".mp4" if asset["kind"] == "video" else ".jpg"
     dest = asset_dir / f"scene_{i:02d}{suffix}"
     if download_from:
         download(download_from, dest)
+        if asset["kind"] == "image":   # some archives answer with an error page instead of the picture
+            try:
+                from PIL import Image
+                with Image.open(dest) as img:
+                    img.verify()
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"The picture downloaded for scene {i + 1} could not be read ({download_from[:120]})")
+        report_use(asset)
     else:
         shutil.copyfile(copy_from, dest)
     for old in asset_dir.glob(f"scene_{i:02d}.*"):   # a swapped visual may have had another file type
@@ -1024,8 +1258,7 @@ def refetch_visual(project: Path, script: dict, timeline: list[dict], i: int) ->
     old = manifest[i] if i < len(manifest) else None
     used = {a["id"] for a in manifest if a} | rejected_assets(project)
     log(f"Searching for another visual for scene {i + 1}: {script['scenes'][i]['visual']['query']}")
-    asset = find_visual(script["scenes"][i], used, timeline[i]["duration"])
-    store_asset(project, manifest, i, asset, download_from=asset["url"])
+    asset = fetch_into(project, manifest, i, script["scenes"][i], used, timeline[i]["duration"])
     if old:
         reject_asset(project, old["id"])
     log(f"Scene {i + 1} now uses: {asset['credit']}")
@@ -1041,6 +1274,8 @@ def use_visual(project: Path, i: int, picked: dict) -> dict:
     old = manifest[i] if i < len(manifest) else None
     asset = {"kind": picked["kind"], "url": url, "id": picked["id"], "credit": picked.get("credit", ""),
              "query": picked.get("query", ""), "source": picked.get("source", "")}
+    if picked.get("track"):
+        asset["track"] = picked["track"]
     log(f"Downloading the {asset['kind']} you picked for scene {i + 1} ({picked.get('provider', asset['source'])})")
     store_asset(project, manifest, i, asset, download_from=url)
     if old and old.get("id") != asset["id"]:
@@ -2007,6 +2242,9 @@ def settings_problems() -> list[str]:
         problems.append(f"VOICE_SPEED is {VOICE_SPEED:g}; ElevenLabs accepts 0.7 to 1.2")
     if CROSSFADE < 0 or CROSSFADE > 2:
         problems.append(f"CROSSFADE is {CROSSFADE:g}; use 0 (hard cuts) up to 2 seconds")
+    unknown = [p for p in VISUAL_PROVIDERS if p not in PROVIDERS]
+    if unknown:
+        problems.append(f"VISUAL_PROVIDERS has unknown names ({', '.join(unknown)}); use: {', '.join(PROVIDERS)}")
     return problems
 
 

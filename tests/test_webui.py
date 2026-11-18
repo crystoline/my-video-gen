@@ -137,7 +137,8 @@ def test_the_visual_picker_shows_results_and_uses_only_what_the_server_found(cli
     assert client.post(url, json={"action": "pick_visual", "scene": 1, "candidate": "pixabay-video:999"},
                        headers=H).status_code == 400
     downloaded = []
-    monkeypatch.setattr(pl, "download", lambda u, dest: downloaded.append(u) or dest.write_bytes(b"clip"))
+    monkeypatch.setattr(pl, "download", lambda u, dest: downloaded.append(u) or dest.write_bytes(
+        png_bytes() if u.endswith(".jpg") else b"clip"))
     run_job(client, slug, action="pick_visual", scene=1, candidate="pixabay-video:42", query="molten lava",
             url="https://evil.example/x.mp4")
     assert downloaded == ["https://cdn.example/clip.mp4"]

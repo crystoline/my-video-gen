@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import itertools
 import json
 import math
@@ -76,7 +77,7 @@ def configure() -> None:
     global ANTHROPIC_MODEL, FACTCHECK_MODEL, FACTCHECK_SEARCHES, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
     global ELEVENLABS_MODEL, VOICE_STABILITY, VOICE_SIMILARITY, VOICE_STYLE, VOICE_SPEAKER_BOOST, VOICE_SPEED
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
-    global YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    global RENDER_JOBS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
     FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
@@ -96,6 +97,7 @@ def configure() -> None:
     MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
     MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
     CROSSFADE = float(os.getenv("CROSSFADE", "0.5"))
+    RENDER_JOBS = int(os.getenv("RENDER_JOBS") or 0)   # scenes rendered at once; 0 = automatic
     YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
     YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
     THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
@@ -127,9 +129,9 @@ def log(msg: str) -> None:
         hook(line)
 
 
-def run(cmd: list) -> str:
+def run(cmd: list, cwd: Path | None = None) -> str:
     cmd = [str(c) for c in cmd]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr[-2000:]}")
     return result.stdout
@@ -915,20 +917,57 @@ def set_custom_visual(project: Path, i: int, path: Path, credit: str = "") -> di
 # ----------------------------------------------------------------------------
 # Step 4: render with FFmpeg
 # ----------------------------------------------------------------------------
-def render_scene(asset: dict, frames: int, out: Path, index: int) -> None:
+def render_jobs() -> int:
+    """How many scenes render at once: RENDER_JOBS from .env, or a quarter of the CPU cores (1 to 4)."""
+    return RENDER_JOBS if RENDER_JOBS > 0 else max(1, min(4, (os.cpu_count() or 2) // 4))
+
+
+# Every scene is converted to and tagged as HD colour (BT.709, limited range), so scenes from different
+# sources join without colour shifts or mid-stream format changes.
+RENDER_VERSION = 2   # bump when render_scene's output changes, so cached scenes are rendered again
+TAG_BT709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+_SCALE_MATRIX = {"bt709": "bt709", "bt470bg": "bt601", "smpte170m": "smpte170m", "bt601": "bt601",
+                 "smpte240m": "smpte240m", "fcc": "fcc", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
+
+
+def source_matrix(path) -> str:
+    """The colour matrix of a video file, for converting it correctly. Untagged files are assumed to be
+    BT.709 when they are HD and BT.601 when smaller, which is what players assume too."""
+    try:
+        out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_space,height",
+                   "-of", "default=nw=1", path])
+    except RuntimeError:
+        return "bt709"
+    info = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    if info.get("color_space") in _SCALE_MATRIX:
+        return _SCALE_MATRIX[info["color_space"]]
+    return "bt709" if int(info.get("height") or 1080) >= 720 else "bt601"
+
+
+def render_scene(asset: dict, frames: int, out: Path, index: int, size: tuple[int, int] | None = None,
+                 keyframes: tuple[int, ...] | list[int] = ()) -> None:
+    """Render one scene's visual to exactly `frames` frames. `keyframes` are frame numbers where the
+    segment will later be cut without re-encoding (where its cross-fades start and end)."""
+    w, h = size or (W, H)
     src = asset["path"]
     if asset["kind"] == "image":
         # Slow "Ken Burns" zoom; alternate zoom-in and zoom-out for variety.
         step = 0.20 / max(frames, 1)
         z = f"1+{step:.7f}*on" if index % 2 == 0 else f"1.20-{step:.7f}*on"
-        vf = (f"scale={W * 2}:{H * 2}:force_original_aspect_ratio=increase,crop={W * 2}:{H * 2},"
+        vf = (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
               f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-              f":d={frames}:s={W}x{H}:fps={FPS},setsar=1,format=yuv420p")
-        run(["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", frames, *ENCODE, out])
+              f":d={frames}:s={w}x{h}:fps={FPS},setsar=1,"
+              f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_BT709}")
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf]
     else:
-        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1,format=yuv420p"
-        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf,
-             "-frames:v", frames, "-an", *ENCODE, out])
+        vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase:in_color_matrix={source_matrix(src)}"
+              f":out_color_matrix=bt709:out_range=tv,crop={w}:{h},fps={FPS},setsar=1,format=yuv420p,{TAG_BT709}")
+        cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf, "-an"]
+    if keyframes:
+        cmd += ["-force_key_frames", "expr:" + "+".join(f"eq(n,{k})" for k in keyframes), "-forced-idr", "1"]
+    tmp = out.with_name(out.stem + ".part.mp4")   # a half-written file must never look like a finished scene
+    run([*cmd, "-frames:v", frames, *ENCODE, tmp])
+    tmp.replace(out)
 
 
 def crossfade_frames() -> int:
@@ -940,28 +979,27 @@ def crossfade_frames() -> int:
     return round(CROSSFADE * FPS)
 
 
-def segment_frames(path: Path) -> int | None:
-    """Frames in a rendered segment, or None if it is missing or unreadable."""
-    if not path.exists():
-        return None
-    try:
-        n = video_frames(path)
-        return n if n is not None else round(media_duration(path) * FPS)
-    except (RuntimeError, ValueError):
-        return None
+def packet_count(path: Path) -> int | None:
+    out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+               "-show_entries", "stream=nb_read_packets", "-of", "default=nw=1:nk=1", path])
+    # MPEG-TS files list the stream twice (once inside its program), so take the first number
+    return next((int(line) for line in out.split() if line.isdigit()), None)
 
 
-def join_segments(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> None:
+def _file_sig(path: Path) -> list[int]:
+    st = path.stat()
+    return [st.st_mtime_ns, st.st_size]
+
+
+def fade_cuts(i: int, n: int, frames: int, xf: int) -> list[int]:
+    """Frame numbers where scene i's segment is cut: after the fade-in it shares with the scene
+    before it (the first xf frames) and where its fade-out into the next scene starts."""
+    return ([xf] if i > 0 else []) + ([frames] if i < n - 1 else [])
+
+
+def _join_chain(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> None:
+    """Cross-fade every segment in one filter graph. Re-encodes the whole video; only used as a fallback."""
     n = len(timeline)
-    if xf == 0:
-        # Hard cuts: concatenate without re-encoding (relative paths, resolved from the list file's folder)
-        (seg_dir / "list.txt").write_text(
-            "".join(f"file 'seg_{i:02d}.mp4'\n" for i in range(n)), encoding="utf-8")
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", seg_dir / "list.txt", "-c", "copy", out])
-        return
-    # Cross-fades: every segment except the last was rendered xf frames long, and each
-    # transition consumes exactly those frames, so the result is as long as the narration.
-    log(f"Joining {n} scenes with {xf / FPS:.2f}s cross-fades (one re-encode)")
     inputs, chain = [], []
     for i in range(n):
         inputs += ["-i", seg_dir / f"seg_{i:02d}.mp4"]
@@ -975,39 +1013,170 @@ def join_segments(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> No
     run(["ffmpeg", "-y", *inputs, "-filter_complex", ";".join(chain), "-map", "[v]", *ENCODE, out])
 
 
-def render_segments(project: Path, timeline: list[dict], assets: list[dict]) -> int:
-    """Render each scene that is missing, has the wrong length, or whose visual was swapped. Returns xfade frames."""
-    seg_dir = project / "segments"
-    seg_dir.mkdir(exist_ok=True)
+def _split_segment(seg: Path, cuts: list[int], dests: list[Path], expect: list[int]) -> None:
+    """Cut a segment at its keyframes without re-encoding."""
+    parts = dests[0].parent
+    pattern = parts / f"split_{seg.stem}_%d.ts"
+    run(["ffmpeg", "-y", "-i", seg, "-map", "0:v", "-c", "copy", "-f", "segment",
+         "-segment_frames", ",".join(map(str, cuts)), "-reset_timestamps", "1", "-segment_format", "mpegts", pattern])
+    pieces = [parts / f"split_{seg.stem}_{k}.ts" for k in range(len(dests))]
+    try:
+        counts = [packet_count(p) if p.exists() else None for p in pieces]
+        if counts != expect or (parts / f"split_{seg.stem}_{len(dests)}.ts").exists():
+            raise RuntimeError(f"{seg.name} did not split into {expect} frames (got {counts})")
+        for piece, dest in zip(pieces, dests):
+            piece.replace(dest)
+    finally:
+        for leftover in parts.glob(f"split_{seg.stem}_*.ts"):
+            leftover.unlink()
+
+
+def _make_fade(tail: Path, head: Path, xf: int, out: Path) -> None:
+    tmp = out.with_name(out.stem + ".part.ts")
+    run(["ffmpeg", "-y", "-i", tail, "-i", head, "-filter_complex",
+         f"[0:v]settb=AVTB,fps={FPS}[a];[1:v]settb=AVTB,fps={FPS}[b];"
+         f"[a][b]xfade=transition=fade:duration={xf / FPS:.6f}:offset=0,{TAG_BT709}[v]",
+         "-map", "[v]", "-frames:v", xf, *ENCODE, "-f", "mpegts", tmp])
+    tmp.replace(out)
+
+
+def _join_pieces(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> None:
+    """Cross-fades without re-encoding the whole video: each segment is cut at its keyframes into
+    head / body / tail, only the short fades (tail of one scene + head of the next) are encoded, and
+    everything is concatenated as is. Pieces are cached, so after changing one scene only its own
+    pieces and its two fades are redone."""
+    n = len(timeline)
+    parts = seg_dir / "parts"
+    parts.mkdir(exist_ok=True)
+    index_path = parts / "index.json"
+    index = load_json(index_path) if index_path.exists() else {}
+    keep = {index_path.name}
+    body_frames = []
+    for i, tl in enumerate(timeline):
+        seg = seg_dir / f"seg_{i:02d}.mp4"
+        cuts = fade_cuts(i, n, tl["frames"], xf)
+        names = (["head"] if i > 0 else []) + ["body"] + (["tail"] if i < n - 1 else [])
+        dests = [parts / f"seg_{i:02d}_{name}.ts" for name in names]
+        start = xf if i > 0 else 0
+        expect = ([xf] if i > 0 else []) + [tl["frames"] - start] + ([xf] if i < n - 1 else [])
+        sig = {"seg": _file_sig(seg), "cuts": cuts}
+        keep.update(d.name for d in dests)
+        body_frames.append(tl["frames"] - start)
+        if index.get(seg.stem) != sig or not all(d.exists() for d in dests):
+            _split_segment(seg, cuts, dests, expect)
+            index[seg.stem] = sig
+            save_json(index_path, index)
+    fades = 0
+    for i in range(n - 1):
+        tail, head = parts / f"seg_{i:02d}_tail.ts", parts / f"seg_{i + 1:02d}_head.ts"
+        fade = parts / f"fade_{i:02d}.ts"
+        sig = {"tail": _file_sig(tail), "head": _file_sig(head), "xf": xf}
+        keep.add(fade.name)
+        if index.get(fade.stem) != sig or not fade.exists():
+            _make_fade(tail, head, xf, fade)
+            index[fade.stem] = sig
+            save_json(index_path, index)
+            fades += 1
+    lines = ["ffconcat version 1.0"]
+    for i in range(n):
+        lines += [f"file 'seg_{i:02d}_body.ts'", f"duration {body_frames[i] / FPS:.6f}"]
+        if i < n - 1:
+            lines += [f"file 'fade_{i:02d}.ts'", f"duration {xf / FPS:.6f}"]
+    (parts / "join.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    keep.add("join.txt")
+    log(f"Joining {n} scenes with {xf / FPS:.2f}s cross-fades ({fades} of {n - 1} fades re-made)")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", parts / "join.txt", "-map", "0:v", "-c", "copy", out])
+    for f in parts.iterdir():   # pieces of scenes that no longer exist
+        if f.name not in keep:
+            f.unlink()
+
+
+def join_segments(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> None:
+    n = len(timeline)
+    if xf == 0:
+        # Hard cuts: concatenate without re-encoding (relative paths, resolved from the list file's folder)
+        (seg_dir / "list.txt").write_text(
+            "".join(f"file 'seg_{i:02d}.mp4'\n" for i in range(n)), encoding="utf-8")
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", seg_dir / "list.txt", "-c", "copy", out])
+        return
+    # Every segment except the last was rendered xf frames longer, and each cross-fade consumes
+    # exactly those frames, so the result is as long as the narration.
+    if all(t["frames"] > xf for t in timeline[1:]):
+        try:
+            _join_pieces(seg_dir, timeline, xf, out)
+            if video_frames(out) == sum(t["frames"] for t in timeline):
+                return
+            log("Note: the quick join came out the wrong length; joining again the slow way")
+        except RuntimeError as e:
+            log(f"Note: the quick join failed ({str(e).splitlines()[0][:200]}); joining the slow way")
+    log(f"Joining {n} scenes with {xf / FPS:.2f}s cross-fades (one re-encode of the whole video)")
+    _join_chain(seg_dir, timeline, xf, out)
+
+
+def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg_dir: Path | None = None,
+                    size: tuple[int, int] | None = None, zoom: list[int] | None = None) -> int:
+    """Render each scene that is missing, has the wrong length, or whose visual was swapped, several at
+    a time. Returns the cross-fade length in frames. `zoom` sets each scene's zoom direction (by default
+    its position)."""
+    seg_dir = seg_dir or project / "segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    size = tuple(size or (W, H))
     n = len(assets)
+    zoom = zoom or list(range(n))
     xf = crossfade_frames() if n > 1 else 0
+    index_path = seg_dir / "render.json"
+    index = load_json(index_path) if index_path.exists() else {}
+    todo = []
     for i, (tl, asset) in enumerate(zip(timeline, assets)):
         out = seg_dir / f"seg_{i:02d}.mp4"
         want = tl["frames"] + (xf if i < n - 1 else 0)
-        have = segment_frames(out)
-        swapped = have is not None and Path(asset["path"]).stat().st_mtime > out.stat().st_mtime
-        if have == want and not swapped:
+        src = Path(asset["path"])
+        key = {"frames": want, "keyframes": fade_cuts(i, n, tl["frames"], xf) if xf else [],
+               "asset": [src.name, *_file_sig(src)], "zoom": zoom[i] % 2, "size": list(size), "v": RENDER_VERSION}
+        have = index.get(out.stem) or {}
+        if out.exists() and have.get("segment") == _file_sig(out) and all(have.get(k) == v for k, v in key.items()):
             continue
-        if swapped:
+        if out.exists() and have.get("asset") and have["asset"] != key["asset"]:
             log(f"Scene {i + 1} has a new visual, re-rendering")
-        elif have is not None:
-            log(f"Scene {i + 1} changed length ({have} -> {want} frames), re-rendering")
+        elif out.exists() and have.get("frames") and have["frames"] != want:
+            log(f"Scene {i + 1} changed length ({have['frames']} -> {want} frames), re-rendering")
         else:
             log(f"Rendering scene {i + 1}/{n} ({asset['kind']}, {tl['duration']:.1f}s)")
-        render_scene(asset, want, out, i)
+        todo.append((i, asset, want, out, key))
+    if todo:
+        workers = min(render_jobs(), len(todo))
+        if workers > 1:
+            log(f"Rendering {len(todo)} scene(s), {workers} at a time")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(render_scene, asset, want, out, zoom[i], size, key["keyframes"]): (i, out, key)
+                       for i, asset, want, out, key in todo}
+            try:
+                for done, future in enumerate(as_completed(futures), start=1):
+                    future.result()
+                    i, out, key = futures[future]
+                    index[out.stem] = dict(key, segment=_file_sig(out))
+                    save_json(index_path, index)   # saved after each scene so a crash loses nothing
+                    if len(todo) > 1:
+                        log(f"  {done}/{len(todo)} scenes rendered")
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
     for extra in seg_dir.glob("seg_*.mp4"):   # left over from scenes that were deleted
         m = re.fullmatch(r"seg_(\d+)\.mp4", extra.name)
         if m and int(m.group(1)) >= n:
             extra.unlink()
+            index.pop(extra.stem, None)
+            save_json(index_path, index)
     return xf
 
 
-def join_needed(project: Path, timeline: list[dict], video_only: Path) -> bool:
-    """Joining re-encodes the whole video, so skip it when no segment changed since the last join."""
+def join_needed(seg_dir: Path, timeline: list[dict], video_only: Path) -> bool:
+    """Skip the join when no segment changed since the last one."""
     if not video_only.exists() or video_frames(video_only) != sum(t["frames"] for t in timeline):
         return True
     joined = video_only.stat().st_mtime
-    return any((project / "segments" / f"seg_{i:02d}.mp4").stat().st_mtime > joined for i in range(len(timeline)))
+    return any((seg_dir / f"seg_{i:02d}.mp4").stat().st_mtime > joined for i in range(len(timeline)))
 
 
 def concat_narration(project: Path, n: int, out: Path, name: str = "list.txt") -> Path:
@@ -1042,13 +1211,96 @@ def voice_filters(tone: str | None = None) -> list[str]:
     return [f for f in chain if ffmpeg_has_filter(f.split("=", 1)[0])]
 
 
-def music_gain_db() -> float | None:
-    """Gain that puts the music MUSIC_VOLUME below the narration, whatever loudness the track was mastered at."""
-    if not (MUSIC_PATH and MUSIC_PATH.is_file()):
+# ----------------------------------------------------------------------------
+# Music: MUSIC_PATH is one track for every video, or a folder of tracks (each video then gets the
+# track used least so far, and keeps it). A video can also choose its own track in the web UI.
+# ----------------------------------------------------------------------------
+MUSIC_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
+
+
+def load_meta(project: Path) -> dict:
+    """project.json: the topic plus per-video choices made in the web UI (music, Short)."""
+    path = Path(project) / "project.json"
+    try:
+        return load_json(path) if path.exists() else {}
+    except ValueError:
+        return {}
+
+
+def save_meta(project: Path, meta: dict) -> None:
+    Path(project).mkdir(parents=True, exist_ok=True)
+    save_json(Path(project) / "project.json", meta)
+
+
+def music_library() -> Path:
+    """The folder of tracks: MUSIC_PATH if it is a folder, the folder of the MUSIC_PATH track, or music/."""
+    if MUSIC_PATH and MUSIC_PATH.is_dir():
+        return MUSIC_PATH
+    if MUSIC_PATH and MUSIC_PATH.is_file():
+        return MUSIC_PATH.parent
+    return SCRIPT_DIR / "music"
+
+
+def music_tracks() -> list[Path]:
+    lib = music_library()
+    if not lib.is_dir():
+        return []
+    return sorted((f for f in lib.iterdir() if f.is_file() and f.suffix.lower() in MUSIC_EXTS
+                   and not f.name.startswith(".")), key=lambda f: f.name.lower())
+
+
+def describe_default_music() -> str:
+    if MUSIC_PATH and MUSIC_PATH.is_dir():
+        return f"a different track for each video from {MUSIC_PATH.name}/"
+    if MUSIC_PATH and MUSIC_PATH.is_file():
+        return MUSIC_PATH.name
+    return "no music"
+
+
+def project_music(project: Path, save: bool = True) -> Path | None:
+    """The track for this video. save=False only predicts an automatic pick without recording it."""
+    project = Path(project)
+    meta = load_meta(project)
+    choice = meta.get("music")
+    rotating = bool(MUSIC_PATH and MUSIC_PATH.is_dir())
+    if choice == "none":
         return None
-    lufs = integrated_loudness(MUSIC_PATH)
+    if choice and (rotating or not meta.get("music_auto")):   # automatic picks only count while rotating
+        track = music_library() / choice
+        if track.is_file():
+            return track
+        if save:
+            log(f"Note: this video's music track {choice} is no longer in {music_library()}; using the default")
+    if MUSIC_PATH and MUSIC_PATH.is_file():
+        return MUSIC_PATH
+    if not rotating:
+        return None
+    tracks = music_tracks()
+    if not tracks:
+        return None
+    used: dict[str, int] = {}
+    if PROJECTS_DIR.is_dir():
+        for d in PROJECTS_DIR.iterdir():
+            other = load_meta(d).get("music") if d.is_dir() and d.resolve() != project.resolve() else None
+            if other:
+                used[other] = used.get(other, 0) + 1
+    # The least-used track; ties are broken by a hash of the video's name so the pick is stable
+    track = min(tracks, key=lambda t: (used.get(t.name, 0),
+                                       hashlib.sha1(f"{project.name}/{t.name}".encode()).hexdigest()))
+    if save:
+        meta.update(music=track.name, music_auto=True)
+        save_meta(project, meta)
+        log(f"Music for this video: {track.name} (picked automatically; change it on the Video tab)")
+    return track
+
+
+def music_gain_db(music: Path | None) -> float | None:
+    """Gain that puts the music MUSIC_VOLUME below the narration, whatever loudness the track was mastered at."""
+    if not (music and Path(music).is_file()):
+        return None
+    lufs = integrated_loudness(Path(music))
     if lufs is None:
-        log(f"Note: {MUSIC_PATH.name} seems silent or unreadable, so the music is left out")
+        log(f"Note: {Path(music).name} seems silent or unreadable, so the music is left out")
         return None
     return VOICE_LUFS + 20 * math.log10(MUSIC_VOLUME) - lufs
 
@@ -1071,23 +1323,33 @@ def audio_filter(voice_in: str, music_in: str | None, gain_db: float | None, ton
     return ";".join(graph)
 
 
-def describe_music() -> str:
-    if not (MUSIC_PATH and MUSIC_PATH.is_file()):
+def describe_music(music: Path | None) -> str:
+    if not (music and Path(music).is_file()):
         return "no music"
     duck = ", ducked under speech" if MUSIC_DUCKING else ""
-    return f"music {MUSIC_PATH.name} {-20 * math.log10(MUSIC_VOLUME):.0f} dB below the voice{duck}"
+    return f"music {Path(music).name} {-20 * math.log10(MUSIC_VOLUME):.0f} dB below the voice{duck}"
 
 
-def mix_final(video_only: Path, narration: Path, final: Path) -> None:
-    gain = music_gain_db()
+def mix_final(video_only: Path, narration: Path, final: Path, music: Path | None = None,
+              subtitles: str | None = None) -> None:
+    """Final mix: narration (+ optional music bed), loudness-normalised for YouTube. The video is copied as is,
+    unless `subtitles` names an .ass file (relative to the output's folder) to burn in, which re-encodes it."""
+    # Absolute paths: FFmpeg runs in the output's folder so the subtitles filter needs no path escaping
+    video_only, narration, final = Path(video_only).resolve(), Path(narration).resolve(), Path(final).resolve()
+    music = Path(music).resolve() if music else None
+    gain = music_gain_db(music)
     inputs = ["-i", video_only, "-i", narration]
     if gain is not None:
-        inputs += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+        inputs += ["-stream_loop", "-1", "-i", music]
     fc = audio_filter("1:a", "2:a" if gain is not None else None, gain)
-    log(f"Mixing final video (voice tone: {VOICE_TONE}, {describe_music()})")
-    run(["ffmpeg", "-y", *inputs, "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
-         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-         "-movflags", "+faststart", "-shortest", final])
+    log(f"Mixing {'the Short' if subtitles else 'final video'} (voice tone: {VOICE_TONE}, "
+        f"{describe_music(music if gain is not None else None)})")
+    if subtitles:   # (the audio graph uses the labels [v] and [m] itself)
+        video = ["-filter_complex", f"[0:v]subtitles={subtitles}[burned];{fc}", "-map", "[burned]", *ENCODE]
+    else:
+        video = ["-filter_complex", fc, "-map", "0:v", "-c:v", "copy"]
+    run(["ffmpeg", "-y", *inputs, *video, "-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+         "-movflags", "+faststart", "-shortest", final], cwd=Path(final).parent)
 
 
 def preview_mix(project: Path, out: Path, seconds: float = 45, tone: str | None = None,
@@ -1101,10 +1363,11 @@ def preview_mix(project: Path, out: Path, seconds: float = 45, tone: str | None 
     if not wavs:
         raise RuntimeError("This project has no voiceover yet, so there is nothing to preview")
     narration = concat_narration(project, len(wavs), project / "audio" / "preview_narration.wav", "preview_list.txt")
-    gain = music_gain_db() if music else None
+    track = project_music(project) if music else None
+    gain = music_gain_db(track)
     inputs = ["-i", narration]
     if gain is not None:
-        inputs += ["-stream_loop", "-1", "-i", MUSIC_PATH]
+        inputs += ["-stream_loop", "-1", "-i", track]
     fc = audio_filter("0:a", "1:a" if gain is not None else None, gain, tone)
     run(["ffmpeg", "-y", *inputs, "-filter_complex", fc, "-map", "[a]", "-t", f"{seconds:g}",
          "-c:a", "libmp3lame", "-b:a", "192k", out])
@@ -1116,12 +1379,11 @@ def assemble(project: Path, timeline: list[dict], assets: list[dict]) -> Path:
     n = len(assets)
     xf = render_segments(project, timeline, assets)
     video_only = project / "video_only.mp4"
-    if join_needed(project, timeline, video_only):
+    if join_needed(project / "segments", timeline, video_only):
         join_segments(project / "segments", timeline, xf, video_only)
     narration = concat_narration(project, n, project / "narration.wav")
-    # Final mix: narration (+ optional music bed), loudness-normalised for YouTube
     final = project / "final.mp4"
-    mix_final(video_only, narration, final)
+    mix_final(video_only, narration, final, project_music(project))
     log(f"Video ready: {final} ({media_duration(final) / 60:.1f} min)")
     return final
 
@@ -1167,23 +1429,27 @@ def estimated_timings(text: str, speech: float) -> list[tuple[str, float, float]
     return out
 
 
-def build_cues(project: Path, script: dict, timeline: list[dict]) -> list[tuple[float, float, str]]:
+def scene_words(project: Path, i: int, scene: dict, tl: dict) -> list[tuple[str, float, float]]:
+    """(word, start, end) for one scene, from the saved ElevenLabs timing or estimated."""
+    align_path = project / "audio" / f"scene_{i:02d}.json"
+    words = None
+    if align_path.exists():
+        try:
+            words = word_timings(load_json(align_path))
+        except (ValueError, KeyError, TypeError):
+            words = None
+    return words or estimated_timings(scene["narration"].strip(), tl["speech"])
+
+
+def build_cues(project: Path, script: dict, timeline: list[dict], scenes: list[int] | None = None,
+               max_words: int = MAX_CUE_WORDS, max_chars: int = MAX_CUE_CHARS) -> list[tuple[float, float, str]]:
+    """Caption cues for the given scenes (all by default), timed from the start of the first one."""
     cues, offset = [], 0.0
-    for i, (scene, tl) in enumerate(zip(script["scenes"], timeline)):
-        text = scene["narration"].strip()
-        align_path = project / "audio" / f"scene_{i:02d}.json"
-        words = None
-        if align_path.exists():
-            try:
-                words = word_timings(load_json(align_path))
-            except (ValueError, KeyError, TypeError):
-                words = None
-        if not words:
-            words = estimated_timings(text, tl["speech"])
+    for i in scenes if scenes is not None else range(len(script["scenes"])):
+        tl = timeline[i]
         group: list[tuple[str, float, float]] = []
-        for w, s, e in words:
-            if group and (len(group) >= MAX_CUE_WORDS
-                          or sum(len(g[0]) for g in group) + len(group) + len(w) > MAX_CUE_CHARS):
+        for w, s, e in scene_words(project, i, script["scenes"][i], tl):
+            if group and (len(group) >= max_words or sum(len(g[0]) for g in group) + len(group) + len(w) > max_chars):
                 cues.append((offset + group[0][1], offset + group[-1][2] + 0.15, " ".join(g[0] for g in group)))
                 group = []
             group.append((w, s, e))
@@ -1248,22 +1514,120 @@ def make_thumbnail(project: Path, script: dict, timeline: list[dict], assets: li
 
 
 # ----------------------------------------------------------------------------
+# Shorts: a vertical cut of a run of scenes with large burned-in captions. It reuses the narration
+# and visuals, so it costs nothing extra.
+# ----------------------------------------------------------------------------
+SHORT_W, SHORT_H = 1080, 1920
+SHORT_TARGET_SECONDS = 58    # the default Short: the opening scenes, up to about a minute
+SHORT_MAX_SECONDS = 180      # YouTube's limit for a Short
+SHORT_CUE_WORDS, SHORT_CUE_CHARS = 3, 18
+
+
+def short_settings(project: Path, script: dict, timeline: list[dict]) -> dict:
+    """The Short's scenes (a continuous range) and title: chosen in the web UI, or the opening scenes."""
+    n = len(script["scenes"])
+    saved = load_meta(project).get("short") or {}
+    first = saved.get("first")
+    first = first if isinstance(first, int) and 0 <= first < n else 0
+    last = saved.get("last")
+    if isinstance(last, int) and last >= first:
+        last = min(last, n - 1)
+    else:
+        last, total = first, timeline[first]["duration"]
+        for k in range(first + 1, n):
+            if total + timeline[k]["duration"] > SHORT_TARGET_SECONDS:
+                break
+            total += timeline[k]["duration"]
+            last = k
+    title = " ".join(str(saved.get("title") or script.get("title") or "").split())
+    seconds = round(sum(timeline[k]["duration"] for k in range(first, last + 1)), 2)
+    return {"first": first, "last": last, "title": title, "seconds": seconds}
+
+
+def ass_time(t: float) -> str:
+    cs = int(round(t * 100))
+    h, cs = divmod(cs, 360_000)
+    m, cs = divmod(cs, 6_000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def ass_text(s: str) -> str:
+    return re.sub(r"[{}\\]", "", s).replace("\n", " ")
+
+
+def write_short_captions(project: Path, script: dict, timeline: list[dict], scenes: list[int], title: str,
+                         out: Path) -> Path:
+    """Subtitles for the Short: the title near the top for the whole Short, and 1-3 word captions below the middle."""
+    total = sum(timeline[i]["duration"] for i in scenes)
+    font = "DejaVu Sans"   # libass falls back to another bold sans font if this one is missing
+    style = ("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+             "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+             "MarginL, MarginR, MarginV, Encoding")
+    lines = ["[Script Info]", "ScriptType: v4.00+", f"PlayResX: {SHORT_W}", f"PlayResY: {SHORT_H}", "WrapStyle: 0",
+             "ScaledBorderAndShadow: yes", "", "[V4+ Styles]", style,
+             f"Style: Caption,{font},84,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,7,3,2,90,90,640,1",
+             f"Style: Title,{font},66,&H0000D6FF,&H00FFFFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,6,3,8,80,80,260,1",
+             "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+    if title:
+        lines.append(f"Dialogue: 0,{ass_time(0)},{ass_time(total)},Title,,0,0,0,,{ass_text(title)}")
+    for start, end, text in build_cues(project, script, timeline, scenes, SHORT_CUE_WORDS, SHORT_CUE_CHARS):
+        lines.append(f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,{ass_text(text)}")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
+def make_short(project: Path, script: dict, timeline: list[dict], assets: list[dict]) -> Path:
+    s = short_settings(project, script, timeline)
+    if s["seconds"] > SHORT_MAX_SECONDS:
+        raise RuntimeError(f"The Short would be {s['seconds']:.0f} s long; YouTube allows at most "
+                           f"{SHORT_MAX_SECONDS} s. Pick fewer scenes.")
+    scenes = list(range(s["first"], s["last"] + 1))
+    d = project / "short"
+    d.mkdir(exist_ok=True)
+    log(f"Making the Short: scenes {s['first'] + 1} to {s['last'] + 1} ({s['seconds']:.0f} s)")
+    sub_tl = [timeline[i] for i in scenes]
+    seg_dir = d / "segments"
+    xf = render_segments(project, sub_tl, [assets[i] for i in scenes], seg_dir=seg_dir,
+                         size=(SHORT_W, SHORT_H), zoom=scenes)
+    video_only = d / "video_only.mp4"
+    if join_needed(seg_dir, sub_tl, video_only):
+        join_segments(seg_dir, sub_tl, xf, video_only)
+    (d / "narration.txt").write_text("".join(f"file '../audio/scene_{i:02d}.wav'\n" for i in scenes), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", d / "narration.txt", "-c", "copy", d / "narration.wav"])
+    subtitles = None
+    if ffmpeg_has_filter("subtitles"):
+        write_short_captions(project, script, timeline, scenes, s["title"], d / "captions.ass")
+        subtitles = "captions.ass"
+    else:
+        log("Note: this FFmpeg cannot burn in captions (it was built without libass), so the Short has none")
+    final = d / "short.mp4"
+    mix_final(video_only, d / "narration.wav", final, project_music(project), subtitles=subtitles)
+    log(f"Short ready: {final} ({media_duration(final):.0f} s)")
+    return final
+
+
+# ----------------------------------------------------------------------------
 # Step 6: YouTube upload
 # ----------------------------------------------------------------------------
+ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
 YT_SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
-             "https://www.googleapis.com/auth/youtube.force-ssl"]  # force-ssl is needed for captions
+             "https://www.googleapis.com/auth/youtube.force-ssl",   # needed for captions and reading statistics
+             ANALYTICS_SCOPE]                                       # watch time per video
 
 
-def youtube_credentials(interactive: bool):
-    """Load the saved login, refresh it if needed, or sign in through the browser (interactive runs only)."""
+def youtube_credentials(interactive: bool, force: bool = False):
+    """Load the saved login, refresh it if needed, or sign in through the browser (interactive runs only).
+    force=True always signs in again (python pipeline.py --login)."""
     from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
     creds = None
-    if YT_TOKEN.exists():
+    if YT_TOKEN.exists() and not force:
         try:
-            creds = Credentials.from_authorized_user_file(str(YT_TOKEN), YT_SCOPES)
+            # The permissions the login was granted (a login saved before statistics were added lacks one)
+            creds = Credentials.from_authorized_user_file(str(YT_TOKEN))
         except ValueError as e:
             log(f"Ignoring unreadable {YT_TOKEN}: {e}")
     if creds and not creds.valid and creds.expired and creds.refresh_token:
@@ -1313,14 +1677,30 @@ def trim_tags(tags: list[str], limit: int = 450) -> list[str]:
     return out
 
 
-def upload(project: Path, script: dict, assets: list[dict], args) -> str:
-    from googleapiclient.http import MediaFileUpload
-    youtube = get_youtube(interactive=not args.yes)
+def upload_status(args) -> dict:
     status = {"privacyStatus": args.privacy, "selfDeclaredMadeForKids": False,
               "containsSyntheticMedia": bool(args.synthetic)}
     if args.publish_at:
         status["privacyStatus"] = "private"  # required by YouTube for scheduled videos
         status["publishAt"] = args.publish_at
+    return status
+
+
+def upload_file(youtube, path: Path, body: dict) -> str:
+    from googleapiclient.http import MediaFileUpload
+    request = youtube.videos().insert(part="snippet,status", body=body,
+                                      media_body=MediaFileUpload(str(path), chunksize=-1, resumable=True))
+    response = None
+    while response is None:
+        progress, response = request.next_chunk()
+        if progress:
+            log(f"  {int(progress.progress() * 100)}%")
+    return response["id"]
+
+
+def upload(project: Path, script: dict, assets: list[dict], args) -> str:
+    from googleapiclient.http import MediaFileUpload
+    youtube = get_youtube(interactive=not args.yes)
     body = {
         "snippet": {
             "title": clean_text(script["title"])[:100],
@@ -1330,18 +1710,10 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
             "defaultLanguage": "en",
             "defaultAudioLanguage": "en",
         },
-        "status": status,
+        "status": upload_status(args),
     }
     log("Uploading to YouTube...")
-    request = youtube.videos().insert(
-        part="snippet,status", body=body,
-        media_body=MediaFileUpload(str(project / "final.mp4"), chunksize=-1, resumable=True))
-    response = None
-    while response is None:
-        progress, response = request.next_chunk()
-        if progress:
-            log(f"  {int(progress.progress() * 100)}%")
-    video_id = response["id"]
+    video_id = upload_file(youtube, project / "final.mp4", body)
     log(f"Uploaded: https://youtu.be/{video_id}")
 
     try:
@@ -1363,15 +1735,114 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
     return video_id
 
 
+def upload_short(project: Path, script: dict, assets: list[dict], args) -> str:
+    """Upload short/short.mp4. Its description links to the full video when that is uploaded already."""
+    s = short_settings(project, script, load_json(project / "timeline.json"))
+    youtube = get_youtube(interactive=not args.yes)
+    tag = " #Shorts"
+    title = clean_text(s["title"] or script["title"]).strip()[:100 - len(tag)] + tag
+    desc = clean_text(script.get("description", "")).strip().split("\n\n")[0]
+    if (project / "youtube.json").exists():
+        desc += f"\n\nFull video: {load_json(project / 'youtube.json')['url']}"
+    credits = list(dict.fromkeys(a["credit"] for a in assets[s["first"]:s["last"] + 1] if a and a.get("credit")))
+    if credits:
+        desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
+    desc += "\n\nNarration uses an AI-generated voice."
+    body = {"snippet": {"title": title, "description": desc[:4900],
+                        "tags": trim_tags(list(script.get("tags", [])) + ["Shorts"]), "categoryId": "28",
+                        "defaultLanguage": "en", "defaultAudioLanguage": "en"},
+            "status": upload_status(args)}
+    log("Uploading the Short to YouTube...")
+    video_id = upload_file(youtube, project / "short" / "short.mp4", body)
+    log(f"Uploaded: https://youtube.com/shorts/{video_id}")
+    return video_id
+
+
+def iso_seconds(value) -> int | None:
+    """Seconds in an ISO 8601 duration such as PT6M5S."""
+    m = re.fullmatch(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", value or "")
+    if not m or not value:
+        return None
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + s
+
+
+def youtube_stats(video_ids: list[str]) -> tuple[dict, list[str]]:
+    """Views, likes and comments (YouTube Data API) plus watch time and average view duration (YouTube
+    Analytics API, which lags a day or two) for your uploads. Returns ({video id: stats}, notes)."""
+    from googleapiclient.discovery import build
+    creds = youtube_credentials(interactive=False)
+    youtube = build("youtube", "v3", credentials=creds)
+    out: dict[str, dict] = {}
+    notes: list[str] = []
+    for k in range(0, len(video_ids), 50):
+        resp = youtube.videos().list(part="statistics,contentDetails,snippet",
+                                     id=",".join(video_ids[k:k + 50])).execute()
+        for item in resp.get("items", []):
+            st = item.get("statistics") or {}
+            out[item["id"]] = {"views": int(st.get("viewCount", 0)), "likes": int(st.get("likeCount", 0)),
+                               "comments": int(st.get("commentCount", 0)),
+                               "seconds": iso_seconds((item.get("contentDetails") or {}).get("duration")),
+                               "published": (item.get("snippet") or {}).get("publishedAt")}
+    missing = [v for v in video_ids if v not in out]
+    if missing:
+        notes.append(f"{len(missing)} upload(s) were not found on YouTube (deleted?): {', '.join(missing)}")
+    if ANALYTICS_SCOPE not in (getattr(creds, "scopes", None) or [ANALYTICS_SCOPE]):
+        notes.append("Watch time needs one more permission than your saved login has. "
+                     "Sign in again with: python pipeline.py --login")
+        return out, notes
+    try:
+        analytics = build("youtubeAnalytics", "v2", credentials=creds)
+        for k in range(0, len(video_ids), 200):
+            resp = analytics.reports().query(
+                ids="channel==MINE", startDate="2005-02-14", endDate=datetime.now().strftime("%Y-%m-%d"),
+                metrics="views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage",
+                dimensions="video", filters="video==" + ",".join(video_ids[k:k + 200]),
+                sort="-views", maxResults=200).execute()
+            cols = [c["name"] for c in resp.get("columnHeaders", [])]
+            for row in resp.get("rows") or []:
+                r = dict(zip(cols, row))
+                out.setdefault(r["video"], {}).update(minutes_watched=r.get("estimatedMinutesWatched"),
+                                                      avg_view_seconds=r.get("averageViewDuration"),
+                                                      avg_view_percent=r.get("averageViewPercentage"))
+    except Exception as e:   # usually: the YouTube Analytics API is not enabled in the Google Cloud project
+        notes.append(f"Watch time is unavailable ({str(e)[:200]}). Enable the YouTube Analytics API in your "
+                     "Google Cloud project (next to the YouTube Data API v3).")
+    return out, notes
+
+
+def elevenlabs_usage() -> dict:
+    """Characters used and left on the ElevenLabs plan this billing period, or {"error": ...}."""
+    if not ELEVENLABS_API_KEY:
+        return {"error": "ELEVENLABS_API_KEY is not set"}
+    try:
+        r = HTTP.get("https://api.elevenlabs.io/v1/user/subscription",
+                     headers={"xi-api-key": ELEVENLABS_API_KEY}, timeout=20)
+    except requests.RequestException as e:
+        return {"error": f"Could not reach ElevenLabs ({type(e).__name__})"}
+    if r.status_code in (401, 403):
+        return {"error": "Your API key cannot read the subscription. In ElevenLabs, give the key the "
+                         "User: Read permission to see your balance here."}
+    if r.status_code != 200:
+        return {"error": f"ElevenLabs answered with error {r.status_code}"}
+    d = r.json()
+    used, limit = int(d.get("character_count") or 0), int(d.get("character_limit") or 0)
+    return {"used": used, "limit": limit, "left": max(limit - used, 0),
+            "resets": d.get("next_character_count_reset_unix"), "tier": d.get("tier")}
+
+
 # ----------------------------------------------------------------------------
 # Orchestration
 # ----------------------------------------------------------------------------
 def settings_problems() -> list[str]:
     """Sound and voice settings that are out of range (shared by the CLI preflight and the web UI)."""
     problems = []
-    if MUSIC_PATH and not MUSIC_PATH.is_file():
+    if MUSIC_PATH and not MUSIC_PATH.exists():
         problems.append(f"MUSIC_PATH points to {MUSIC_PATH}, which does not exist "
                         "(fix the path, or leave MUSIC_PATH empty for narration only)")
+    elif MUSIC_PATH and MUSIC_PATH.is_dir() and not music_tracks():
+        problems.append(f"MUSIC_PATH is the folder {MUSIC_PATH}, which has no music files "
+                        f"({', '.join(e[1:] for e in MUSIC_EXTS)})")
     if not 0 < MUSIC_VOLUME <= 0.5:
         problems.append(f"MUSIC_VOLUME is {MUSIC_VOLUME:g}; use a value above 0 and up to 0.5, e.g. 0.10")
     if VOICE_TONE not in VOICE_TONES:
@@ -1402,7 +1873,9 @@ def preflight(upload_enabled: bool, unattended: bool) -> None:
         log("Note: neither PEXELS_API_KEY nor PIXABAY_API_KEY is set, so only NASA images will be used")
     problems += settings_problems()
     if not problems:
-        log(f"Sound: voice tone {VOICE_TONE}, {describe_music()}")
+        duck = ", ducked under speech" if MUSIC_DUCKING else ""
+        level = f" {-20 * math.log10(MUSIC_VOLUME):.0f} dB below the voice{duck}" if MUSIC_PATH else ""
+        log(f"Sound: voice tone {VOICE_TONE}, music: {describe_default_music()}{level}")
     if upload_enabled:
         if unattended:
             try:
@@ -1539,7 +2012,7 @@ def main() -> None:
     args = p.parse_args()
 
     if args.login:
-        youtube_credentials(interactive=True)
+        youtube_credentials(interactive=True, force=True)
         log(f"YouTube login saved to {YT_TOKEN}")
         return
     preflight(upload_enabled=not args.no_upload, unattended=args.yes)

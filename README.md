@@ -41,7 +41,7 @@ If your system Python is older than 3.10 (Ubuntu 20.04 ships 3.8), get a newer o
 - **ElevenLabs:** create an API key, then pick or design a voice and copy its Voice ID. Pick one voice and keep it; it becomes your channel's identity.
 - **Stock footage:** set `PIXABAY_API_KEY` (free; the key is shown at pixabay.com/api/docs once you log in) and/or `PEXELS_API_KEY` (pexels.com/api, which paused issuing new keys in 2026). Pexels is tried first when both are set. With neither, every scene uses NASA imagery, which is weak for Earth-bound subjects. The NASA library needs no key.
 - **YouTube:** set this up in Google Cloud Console.
-  1. Create a project and enable **YouTube Data API v3**.
+  1. Create a project and enable **YouTube Data API v3**. Also enable the **YouTube Analytics API** if you want watch time in the web interface's statistics.
   2. Configure the **OAuth consent screen** and add your Google account as a test user.
   3. Go to Credentials → Create **OAuth client ID** → type **Desktop app**.
   4. Download the JSON file and save it as `client_secret.json` next to `pipeline.py`.
@@ -76,7 +76,8 @@ If you edit narration later, re-running regenerates only the changed voiceover c
 - `--privacy unlisted|public` sets the upload's privacy.
 - `--synthetic` ticks YouTube's AI-disclosure box. Use it if you add realistic AI-generated visuals.
 - `--project projects/<folder>` resumes a project.
-- `CROSSFADE` in `.env` is the cross-fade length in seconds (default 0.5). Set it to 0 for hard cuts, which also skips a re-encode and renders faster.
+- `CROSSFADE` in `.env` is the cross-fade length in seconds (default 0.5). Set it to 0 for hard cuts.
+- `RENDER_JOBS` in `.env` sets how many scenes render at the same time (default: a quarter of the CPU cores, 1 to 4).
 
 ## 4. Web interface
 
@@ -88,14 +89,15 @@ For reviewing and re-working videos, a local web interface is easier than editin
 
 Then open http://localhost:8765. From WSL, open it in your normal Windows browser. It only accepts connections from this computer. Stop it with Ctrl+C.
 
-- **Videos:** start a video from a topic, and see where every video stands.
+- **Videos:** start a video from a topic, and see where every video stands. Once videos are uploaded, a table shows each one's views, watch time, average view duration and likes (plus its Short's views), so you can see which topics work. Click **Refresh statistics** to update it.
 - **Script:** edit the title, description, tags and each scene's narration and visual search. Apply the fact-checker's fixes with one click, and move, add or delete scenes. Narration clips and visuals follow their scene when you reorder, so nothing is narrated twice. Each scene shows whether its narration clip is current or will be regenerated, with its character count.
 - **Visuals:** see every scene's image or clip. **Choose…** opens a grid of search results from Pexels, Pixabay or NASA with preview images (video clips play when you hover), so you can compare a dozen options, change the search words, and pick one. Only the one you pick is downloaded. **Next result** swaps in the next search result without looking, and you can upload your own image or video. Pick the thumbnail background here too.
-- **Video:** render, watch, preview the sound, update the thumbnail, and upload to YouTube with privacy and schedule options.
+- **Video:** render, watch, choose this video's music track, preview the sound, update the thumbnail, and upload to YouTube with privacy and schedule options.
+- **Short:** make a vertical YouTube Short from a run of scenes (by default the opening scenes, up to about a minute), with large captions and the title at the top, then upload it. It reuses the narration and visuals, so it costs nothing extra; its description links to the full video if that is uploaded first.
 - **Topic queue:** reorder `topics.txt`, start a video from any topic, and send failed topics back to the queue.
-- **Settings:** music file, music level, ducking, voice tone and ElevenLabs voice settings, with a 45-second preview mixed from a real video. Settings are saved to `.env`, so the command line uses them too.
+- **Settings:** default music (one track, or a different track per video), the music library (listen to tracks, add new ones), music level, ducking, voice tone and ElevenLabs voice settings, with a 45-second preview mixed from a real video. It also shows how many ElevenLabs characters you have left this month. Settings are saved to `.env`, so the command line uses them too.
 
-Anything that spends money asks first and shows the ElevenLabs character count. Jobs run one at a time, and their logs are kept in each project's `activity.log`. The web interface and the command line work on the same project folders, so you can mix them.
+Anything that spends money asks first and shows the ElevenLabs character count next to what is left on your plan. Jobs run one at a time, and their logs are kept in each project's `activity.log`. The web interface and the command line work on the same project folders, so you can mix them.
 
 ## 5. Automate
 
@@ -131,14 +133,14 @@ The tests replace Claude, ElevenLabs, the stock searches and YouTube with fakes 
 - **Image rights.** NASA imagery is generally free to use, but some images in the library belong to partners such as ESA or universities. Check the credit, and never imply NASA endorses your channel. Pexels and Pixabay footage is free to use under their content licences. Credits for all sources are added to the video description automatically. Standard Pixabay keys serve photos at most 1280 px wide, so Pixabay stills are upscaled to 1080p; Pexels photos, when available, come at full size.
 - **Costs.** Pexels, Pixabay and NASA are free. The script costs a few cents; the fact-check costs a few cents more plus about one cent per web search. ElevenLabs is the main cost: a 6-minute video is roughly 5,000–6,000 characters, and `review.md` shows the exact count before you commit.
 - **Transient errors.** Calls to ElevenLabs, Pexels, Pixabay and NASA retry automatically on rate limits and server errors before the run gives up.
-- **Music.** Set `MUSIC_PATH` to an audio file and it loops under the narration. The pipeline measures the track's loudness, so `MUSIC_VOLUME` means the same thing with any track: 0.10 puts the music 20 dB below the voice, 0.05 puts it 26 dB below. With `MUSIC_DUCKING` on (the default), the music also dips about 6 dB while the narrator speaks and comes back up in pauses. A wrong path stops the run at startup rather than silently leaving the music out. Use only tracks you have the rights to, such as the YouTube Audio Library.
+- **Music.** Set `MUSIC_PATH` to an audio file and it loops under every video's narration. Set it to a folder of tracks (for example `music`) and each new video gets the track used least so far, then keeps it, so videos don't all sound the same. In the web interface any video can pick its own track or none. The pipeline measures the track's loudness, so `MUSIC_VOLUME` means the same thing with any track: 0.10 puts the music 20 dB below the voice, 0.05 puts it 26 dB below. With `MUSIC_DUCKING` on (the default), the music also dips about 6 dB while the narrator speaks and comes back up in pauses. A wrong path stops the run at startup rather than silently leaving the music out. Use only tracks you have the rights to, such as the YouTube Audio Library.
 - **Voice sound.** `VOICE_TONE` shapes the narration in the final mix: `soft` (the default) tames harsh "s" sounds and the 3 kHz edge and adds a little body, `warm` does more of the same, and `natural` leaves the ElevenLabs audio untouched. The ElevenLabs settings `VOICE_STABILITY`, `VOICE_SIMILARITY`, `VOICE_STYLE`, `VOICE_SPEAKER_BOOST` and `VOICE_SPEED` change how new narration is generated; existing clips keep their sound until they are re-voiced.
-- **Re-mixing is cheap.** Music and voice-tone changes apply when the final video is mixed. Re-running a finished project with `--project` reuses every rendered scene and only re-mixes the audio.
+- **Re-rendering is quick.** Scenes render several at a time. Each scene is rendered with keyframes where its cross-fades start and end, so joining copies the scenes as they are and encodes only the half-second fades. Changing one scene re-renders that scene and its two fades, and the join takes seconds. Music and voice-tone changes apply when the final video is mixed, so they don't re-render anything. After updating MyVideoGen, the first render of an existing video renders every scene once.
+- **Statistics.** Views and likes come from the YouTube Data API. Watch time and average view duration come from the YouTube Analytics API, which needs that API enabled in your Google Cloud project, and lag a day or two. If you signed in before statistics existed, run `python pipeline.py --login` once more to grant the extra read permission.
 
 ## Ideas for later
 
 - Add NASA/ESA video clips, or charts made with matplotlib for data-heavy topics.
-- Build a Shorts version: crop to 9:16 and use the hook scene only.
 - Have Claude write the pinned comment and community posts.
 
 

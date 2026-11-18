@@ -69,6 +69,10 @@ class Fakes:
         self.uploads.append(args)
         return "VID123"
 
+    def upload_short(self, project, script, assets, args):
+        self.uploads.append(("short", args))
+        return "SHORT1"
+
 
 def wait(client, job_id: str, want: str = "done", timeout: float = 900) -> dict:
     end = time.time() + timeout

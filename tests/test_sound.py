@@ -64,7 +64,7 @@ def mix(media: Path, music, volume, monkeypatch, ducking=True, tone="soft"):
     monkeypatch.setattr(pl, "MUSIC_PATH", music)
     monkeypatch.setattr(pl, "MUSIC_VOLUME", volume)
     monkeypatch.setattr(pl, "MUSIC_DUCKING", ducking)
-    gain = pl.music_gain_db() if music else None
+    gain = pl.music_gain_db(music)
     out = media / f"mix_{music.stem if music else 'none'}_{volume}_{ducking}_{tone}.wav"
     inputs = ["-i", media / "voice.wav"] + (["-stream_loop", "-1", "-i", music] if gain is not None else [])
     fc = pl.audio_filter("0:a", "1:a" if gain is not None else None, gain, tone)
@@ -104,7 +104,7 @@ def test_the_music_bed_sits_music_volume_below_the_voice(media, monkeypatch, vol
     monkeypatch.setattr(pl, "MUSIC_VOLUME", volume)
     out = media / f"bed_{volume}.wav"
     ff("-i", media / "silent.wav", "-stream_loop", "-1", "-i", music, "-filter_complex",
-       pl.audio_filter("0:a", "1:a", pl.music_gain_db()), "-map", "[a]", "-t", SECONDS, "-c:a", "pcm_s16le", out)
+       pl.audio_filter("0:a", "1:a", pl.music_gain_db(music)), "-map", "[a]", "-t", SECONDS, "-c:a", "pcm_s16le", out)
     want = pl.VOICE_LUFS + 20 * math.log10(volume)
     assert abs(pl.integrated_loudness(out) - want) < 1.0
 

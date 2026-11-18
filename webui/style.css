@@ -130,6 +130,7 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 .vcard .narr { font-size: .85rem; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 .warn-text { color: var(--warn); }
+audio.mini { height: 32px; max-width: 280px; }
 .modal-back {
   position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, .55);
   display: flex; align-items: flex-start; justify-content: center; padding: 3vh 1rem; overflow: auto;
@@ -148,6 +149,7 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 .pcredit { padding: .2rem .5rem .5rem; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 
 .player { width: 100%; max-height: 70vh; background: #000; border-radius: var(--radius); }
+.player.vertical { width: auto; max-width: 100%; height: 75vh; display: block; margin: 0 auto; }
 .thumbimg { width: 100%; max-width: 480px; border-radius: 8px; border: 1px solid var(--line); }
 
 .savebar {
@@ -168,6 +170,11 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 }
 .toast.bad { background: var(--bad); color: #fff; }
 
+.tablewrap { overflow-x: auto; margin-top: .6rem; }
+table.stats { border-collapse: collapse; width: 100%; font-size: .9rem; }
+table.stats th, table.stats td { padding: .35rem .5rem; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+table.stats th { color: var(--muted); font-weight: 600; }
+table.stats th:first-child, table.stats td:first-child { text-align: left; white-space: normal; }
 table.kv { border-collapse: collapse; width: 100%; }
 table.kv td { padding: .3rem .4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 table.kv td:first-child { color: var(--muted); width: 40%; }

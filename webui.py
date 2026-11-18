@@ -32,7 +32,6 @@ import pipeline as pl
 STATIC_DIR = pl.SCRIPT_DIR / "webui"
 ENV_PATH = pl.SCRIPT_DIR / ".env"
 TOPICS_PATH = pl.SCRIPT_DIR / "topics.txt"
-MUSIC_DIR = pl.SCRIPT_DIR / "music"
 ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
@@ -192,7 +191,7 @@ def timeline_for(p: Path, script: dict) -> list[dict]:
 def project_state(slug: str, detail: bool = False) -> dict:
     p = pl.PROJECTS_DIR / slug
     script = load_script(p)
-    meta = pl.load_json(p / "project.json") if (p / "project.json").exists() else {}
+    meta = pl.load_meta(p)
     job = busy(slug)
     scenes = script["scenes"] if script else []
     n = len(scenes)
@@ -201,7 +200,8 @@ def project_state(slug: str, detail: bool = False) -> dict:
     have_asset = [i < len(manifest) and bool(manifest[i]) and Path(manifest[i]["path"]).exists() for i in range(n)]
     final = p / "final.mp4"
     newest_input = max([mtime(f) for f in (p / "audio").glob("scene_*.mp3")]
-                       + [mtime(f) for f in (p / "assets").glob("scene_*")] + [0.0])
+                       + [mtime(f) for f in (p / "assets").glob("scene_*")]
+                       + [float(meta.get("music_changed") or 0)])
     if not final.exists():
         video = "missing"
     elif mtime(final) < newest_input or todo or not all(have_asset):
@@ -209,6 +209,8 @@ def project_state(slug: str, detail: bool = False) -> dict:
     else:
         video = "ready"
     youtube = pl.load_json(p / "youtube.json") if (p / "youtube.json").exists() else None
+    short_yt = p / "short" / "youtube.json"
+    stats_path = p / "stats.json"
     approved = (p / ".approved").exists()
     voiced_any = len(todo) < n
     if not script:
@@ -238,7 +240,9 @@ def project_state(slug: str, detail: bool = False) -> dict:
         "visuals_ready": sum(have_asset), "video": video, "approved": approved,
         "thumbnail_url": file_url(slug, thumb),
         "youtube": youtube,
-        "updated": max([mtime(f) for f in p.iterdir()] + [mtime(p)]) if p.exists() else 0,
+        "short_youtube": pl.load_json(short_yt) if short_yt.exists() else None,
+        "stats": pl.load_json(stats_path) if stats_path.exists() else None,
+        "updated": max([mtime(f) for f in p.iterdir() if f.name != "stats.json"] + [mtime(p)]) if p.exists() else 0,
         "job": job.to_dict() if job else None,
     }
     if not detail:
@@ -263,7 +267,11 @@ def project_state(slug: str, detail: bool = False) -> dict:
     notes_path = p / "factcheck_notes.md"
     attempts = p / "attempts.json"
     preview = p / "preview_mix.mp3"
+    track = pl.project_music(p, save=False)
     state.update({
+        "short": short_state(slug, p, script, timeline_for(p, script) if script else [], meta, newest_input),
+        "music": {"choice": meta.get("music"), "auto": bool(meta.get("music_auto")),
+                  "track": track.name if track else None, "default": pl.describe_default_music()},
         "script": script, "factcheck": pl.load_json(check_path) if check_path.exists() else None,
         "factcheck_notes": notes_path.read_text(encoding="utf-8") if notes_path.exists() else "",
         "scene_info": scene_info,
@@ -276,6 +284,19 @@ def project_state(slug: str, detail: bool = False) -> dict:
         "activity": (p / "activity.log").read_text(encoding="utf-8")[-20000:] if (p / "activity.log").exists() else "",
     })
     return state
+
+
+def short_state(slug: str, p: Path, script: dict | None, timeline: list[dict], meta: dict, newest_input: float):
+    if not script:
+        return None
+    s = pl.short_settings(p, script, timeline)
+    video = p / "short" / "short.mp4"
+    changed = max(newest_input, float(meta.get("short_changed") or 0))
+    yt = p / "short" / "youtube.json"
+    return dict(s, url=file_url(slug, video), scene_seconds=[t["duration"] for t in timeline],
+                state="missing" if not video.exists() else "outdated" if mtime(video) < changed else "ready",
+                youtube=pl.load_json(yt) if yt.exists() else None, max_seconds=pl.SHORT_MAX_SECONDS,
+                target_seconds=pl.SHORT_TARGET_SECONDS)
 
 
 def list_projects() -> list[dict]:
@@ -437,7 +458,7 @@ def job_rewrite(slug: str, minutes: float) -> None:
     move_to_trash(p, ["script.json", "factcheck.json", "factcheck_notes.md", "review.md", "audio", "assets",
                       "assets.json", "rejected_assets.json", "segments", "timeline.json", "video_only.mp4",
                       "narration.wav", "final.mp4", "thumbnail.jpg", "thumb_frame.jpg", "captions.srt",
-                      ".approved", "preview_mix.mp3"])
+                      ".approved", "preview_mix.mp3", "short"])
     pl.save_json(p / "script.json", script)
     run_factcheck(p, script)
 
@@ -446,7 +467,33 @@ def job_voiceover(slug: str) -> None:
     p = pl.PROJECTS_DIR / slug
     script = need_script(p)
     (p / ".approved").touch()   # the command line will not pause for review on this project again
-    pl.make_voiceover(p, script)
+    try:
+        pl.make_voiceover(p, script)
+    finally:
+        _usage_cache["at"] = 0.0   # characters were spent: read the balance again next time
+
+
+def job_stats() -> None:
+    """Fetch views and watch time for every uploaded video and Short, saved as stats.json in each project."""
+    uploads: dict[str, tuple[str, str]] = {}   # video id -> (project, "video" or "short")
+    for d in sorted(pl.PROJECTS_DIR.iterdir()) if pl.PROJECTS_DIR.exists() else []:
+        for kind, path in (("video", d / "youtube.json"), ("short", d / "short" / "youtube.json")):
+            if d.is_dir() and path.exists():
+                uploads[pl.load_json(path)["video_id"]] = (d.name, kind)
+    if not uploads:
+        pl.log("Nothing has been uploaded yet, so there are no statistics to fetch")
+        return
+    pl.log(f"Fetching statistics for {len(uploads)} upload(s)")
+    stats, notes = pl.youtube_stats(list(uploads))
+    for note in notes:
+        pl.log(note)
+    per_project: dict[str, dict] = {}
+    for video_id, (slug, kind) in uploads.items():
+        per_project.setdefault(slug, {})[kind] = dict(stats.get(video_id) or {}, video_id=video_id)
+    fetched = datetime.now().isoformat(timespec="seconds")
+    for slug, data in per_project.items():
+        pl.save_json(pl.PROJECTS_DIR / slug / "stats.json", dict(data, fetched=fetched))
+    pl.log(f"Statistics saved for {len(per_project)} video(s)")
 
 
 def job_revoice(slug: str, scene: int) -> None:
@@ -494,6 +541,30 @@ def job_render(slug: str) -> None:
     pl.log("Captions and thumbnail updated")
 
 
+def job_short(slug: str) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    if pl.voiceover_todo(p, script):
+        raise RuntimeError("Some scenes have new or changed narration. Generate the voiceover first.")
+    timeline = pl.make_voiceover(p, script)   # nothing to synthesize; this only measures the clips
+    assets = pl.gather_visuals(p, script, timeline)
+    pl.make_short(p, script, timeline, assets)
+
+
+def job_upload_short(slug: str, privacy: str, publish_at: str | None, synthetic: bool) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    done = p / "short" / "youtube.json"
+    if done.exists():
+        raise RuntimeError(f"This Short is already uploaded: {pl.load_json(done)['url']}")
+    if (project_state(slug, detail=True)["short"] or {}).get("state") != "ready":
+        raise RuntimeError("The Short is missing or out of date. Make it first.")
+    args = SimpleNamespace(yes=True, privacy=privacy, publish_at=publish_at, synthetic=synthetic)
+    video_id = pl.upload_short(p, script, pl.load_manifest(p)[:len(script["scenes"])], args)
+    pl.save_json(done, {"video_id": video_id, "url": f"https://youtube.com/shorts/{video_id}",
+                        "uploaded_at": datetime.now().isoformat()})
+
+
 def job_thumbnail(slug: str) -> None:
     p = pl.PROJECTS_DIR / slug
     script = need_script(p)
@@ -508,7 +579,8 @@ def job_thumbnail(slug: str) -> None:
 def job_preview(slug: str, seconds: float) -> None:
     p = pl.PROJECTS_DIR / slug
     pl.preview_mix(p, p / "preview_mix.mp3", seconds)
-    pl.log(f"Sound preview ready ({seconds:g} s, voice tone {pl.VOICE_TONE}, {pl.describe_music()})")
+    pl.log(f"Sound preview ready ({seconds:g} s, voice tone {pl.VOICE_TONE}, "
+           f"{pl.describe_music(pl.project_music(p, save=False))})")
 
 
 def job_upload(slug: str, privacy: str, publish_at: str | None, synthetic: bool) -> None:
@@ -641,7 +713,20 @@ ACTIONS = {
     "visuals": ("Fetch visuals", job_visuals),
     "render": ("Render the video", job_render),
     "thumbnail": ("Update the thumbnail", job_thumbnail),
+    "short": ("Make the Short", job_short),
 }
+
+
+def publish_time(value) -> str | None:
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("Publish time must look like 2026-11-05T15:00:00Z")
+    if when.tzinfo is None or when <= datetime.now(timezone.utc):
+        raise ValueError("Publish time must be in the future and include a time zone")
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @app.post("/api/projects/<slug>/jobs")
@@ -681,24 +766,56 @@ def api_start_job(slug):
     elif action == "preview":
         seconds = float(data.get("seconds") or 45)
         job = enqueue(slug, action, "Preview the sound", job_preview, slug=slug, seconds=min(max(seconds, 5), 300))
-    elif action == "upload":
+    elif action in ("upload", "upload_short"):
         privacy = data.get("privacy", "private")
         if privacy not in ("private", "unlisted", "public"):
             raise ValueError("Unknown privacy setting")
-        publish_at = data.get("publish_at") or None
-        if publish_at:
-            try:
-                when = datetime.fromisoformat(publish_at.replace("Z", "+00:00"))
-            except ValueError:
-                raise ValueError("Publish time must look like 2026-11-05T15:00:00Z")
-            if when.tzinfo is None or when <= datetime.now(timezone.utc):
-                raise ValueError("Publish time must be in the future and include a time zone")
-            publish_at = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        job = enqueue(slug, action, "Upload to YouTube", job_upload, slug=slug, privacy=privacy,
-                      publish_at=publish_at, synthetic=bool(data.get("synthetic")))
+        label, fn = ("Upload to YouTube", job_upload) if action == "upload" else ("Upload the Short", job_upload_short)
+        job = enqueue(slug, action, label, fn, slug=slug, privacy=privacy,
+                      publish_at=publish_time(data.get("publish_at")), synthetic=bool(data.get("synthetic")))
     else:
         raise ValueError(f"Unknown action: {action}")
     return jsonify(job.to_dict())
+
+
+@app.put("/api/projects/<slug>/short")
+def api_project_short(slug):
+    """Which scenes go into the Short (a continuous range) and its title."""
+    p = project_dir(slug)
+    require_idle(slug)
+    script = need_script(p)
+    data = body()
+    first, last = data.get("first"), data.get("last")
+    n = len(script["scenes"])
+    if not isinstance(first, int) or not isinstance(last, int) or not 0 <= first <= last < n:
+        raise ValueError("Pick a first and last scene, in order")
+    title = " ".join(str(data.get("title") or "").split())
+    if len(title) > 90:
+        raise ValueError("The Short's title is longer than 90 characters")
+    meta = pl.load_meta(p)
+    meta["short"] = {"first": first, "last": last, "title": title}
+    meta["short_changed"] = time.time()
+    pl.save_meta(p, meta)
+    return jsonify(project_state(slug, detail=True))
+
+
+@app.put("/api/projects/<slug>/music")
+def api_project_music(slug):
+    """This video's music: a track name from the library, "none", or null for the default."""
+    p = project_dir(slug)
+    require_idle(slug)
+    choice = body().get("music")
+    meta = pl.load_meta(p)
+    if choice is None:
+        for key in ("music", "music_auto"):
+            meta.pop(key, None)
+    elif choice == "none" or choice in {t.name for t in pl.music_tracks()}:
+        meta.update(music=choice, music_auto=False)
+    else:
+        raise ValueError("That track is not in the music folder")
+    meta["music_changed"] = time.time()   # the video needs a (quick) re-mix
+    pl.save_meta(p, meta)
+    return jsonify(project_state(slug, detail=True))
 
 
 CANDIDATES: "OrderedDict[str, dict]" = OrderedDict()   # search results by id, with their download URLs
@@ -897,14 +1014,92 @@ def write_env(updates: dict[str, str]) -> None:
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def rel_to_app(path: Path) -> str:
+    try:
+        return path.relative_to(pl.SCRIPT_DIR).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def music_info() -> dict:
+    """The music library: its folder, its tracks and how many videos use each."""
+    tracks = pl.music_tracks()
+    used: dict[str, int] = {}
+    if pl.PROJECTS_DIR.exists():
+        for d in pl.PROJECTS_DIR.iterdir():
+            choice = pl.load_meta(d).get("music") if d.is_dir() else None
+            if choice:
+                used[choice] = used.get(choice, 0) + 1
+    lib = pl.music_library()
+    return {"library": rel_to_app(lib), "default": pl.describe_default_music(),
+            "tracks": [{"name": t.name, "path": rel_to_app(t), "url": f"/music/{t.name}", "videos": used.get(t.name, 0)}
+                       for t in tracks]}
+
+
+@app.get("/api/music")
+def api_music():
+    return jsonify(music_info())
+
+
+@app.post("/api/music")
+def api_add_music():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        raise ValueError("Choose an audio file")
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "", Path(f.filename).name).strip(" .") or "track"
+    if Path(name).suffix.lower() not in AUDIO_EXTS:
+        raise ValueError("Use an MP3, WAV, M4A, AAC, OGG or FLAC file")
+    lib = pl.music_library()
+    lib.mkdir(parents=True, exist_ok=True)
+    dest = lib / name
+    if dest.exists():
+        abort(409, f"{name} is already in the music folder")
+    tmp = lib / f".upload-{uuid.uuid4().hex}{dest.suffix}"
+    f.save(tmp)
+    try:
+        if pl.media_duration(tmp) <= 0:
+            raise ValueError
+    except (RuntimeError, ValueError):
+        tmp.unlink(missing_ok=True)
+        abort(400, "Could not read that file as audio")
+    tmp.replace(dest)
+    return jsonify(music_info())
+
+
+@app.get("/music/<name>")
+def music_file(name):
+    track = next((t for t in pl.music_tracks() if t.name == name), None)
+    if not track:
+        abort(404)
+    return send_file(track, max_age=0, conditional=True)
+
+
+_usage_cache: dict = {"at": 0.0, "data": None}
+
+
+@app.get("/api/elevenlabs")
+def api_elevenlabs():
+    """Characters used and left on the ElevenLabs plan (cached for a minute)."""
+    if request.args.get("refresh") or time.time() - _usage_cache["at"] > 60 or _usage_cache["data"] is None:
+        _usage_cache.update(at=time.time(), data=pl.elevenlabs_usage())
+    return jsonify(_usage_cache["data"])
+
+
+@app.post("/api/stats/refresh")
+def api_refresh_stats():
+    running = next((j for j in all_jobs() if j.action == "stats" and j.status in ("queued", "running")), None)
+    job = running or enqueue(None, "stats", "Refresh YouTube statistics", job_stats)
+    return jsonify(job.to_dict())
+
+
 @app.get("/api/status")
 def api_status():
     try:
         ffmpeg = pl.run(["ffmpeg", "-version"]).splitlines()[0]
     except (RuntimeError, OSError):
         ffmpeg = ""
-    music_files = sorted(f.relative_to(pl.SCRIPT_DIR).as_posix() for f in MUSIC_DIR.glob("*")
-                         if f.suffix.lower() in AUDIO_EXTS) if MUSIC_DIR.exists() else []
+    music = music_info()
+    music_files = [t["path"] for t in music["tracks"]]
     return jsonify({
         "keys": {"anthropic": bool(os.getenv("ANTHROPIC_API_KEY")), "elevenlabs": bool(pl.ELEVENLABS_API_KEY),
                  "voice_id": bool(pl.ELEVENLABS_VOICE_ID), "pexels": bool(pl.PEXELS_API_KEY),
@@ -912,7 +1107,8 @@ def api_status():
                  "youtube_login": pl.YT_TOKEN.exists()},
         "models": {"writer": pl.ANTHROPIC_MODEL, "factcheck": pl.FACTCHECK_MODEL, "voice": pl.ELEVENLABS_MODEL},
         "ffmpeg": ffmpeg, "xfade": pl.ffmpeg_has_filter("xfade"),
-        "settings": current_settings(), "music_files": music_files, "voice_tones": list(pl.VOICE_TONES),
+        "settings": current_settings(), "music_files": music_files, "music_library": music["library"],
+        "voice_tones": list(pl.VOICE_TONES),
         "problems": pl.settings_problems(), "projects_dir": str(pl.PROJECTS_DIR),
         "stock_providers": pl.stock_providers(),
     })
@@ -935,12 +1131,12 @@ def api_save_settings():
                 raise ValueError(f"{key} must be a number")
         elif kind == "choice":
             updates[key] = str(value).strip().lower()
-        else:   # path: must be a file inside the project folder, or empty for none
-            value = str(value or "").strip()
+        else:   # path: a file or folder inside the MyVideoGen folder, or empty for none
+            value = str(value or "").strip().rstrip("/")
             if value:
                 path = (pl.SCRIPT_DIR / value).resolve()
-                if pl.SCRIPT_DIR.resolve() not in path.parents or not path.is_file():
-                    raise ValueError(f"{value} is not a file in the MyVideoGen folder")
+                if pl.SCRIPT_DIR.resolve() not in path.parents or not path.exists():
+                    raise ValueError(f"{value} is not a file or folder in the MyVideoGen folder")
             updates[key] = value
     saved = {k: os.environ.get(k) for k in updates}
     os.environ.update(updates)

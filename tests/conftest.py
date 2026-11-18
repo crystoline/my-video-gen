@@ -83,4 +83,5 @@ def fakes(monkeypatch):
     monkeypatch.setattr(pl, "download", f.download)
     monkeypatch.setattr(pl, "tts", f.tts)
     monkeypatch.setattr(pl, "upload", f.upload)
+    monkeypatch.setattr(pl, "upload_short", f.upload_short)
     return f

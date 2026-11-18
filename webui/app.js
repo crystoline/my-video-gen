@@ -171,14 +171,49 @@ async function showProjects() {
     h("div", { class: "row" }, topic, h("label", { class: "row" }, minutes, h("span", { class: "muted small" }, "minutes")),
       h("button", { class: "primary", type: "submit" }, "Write script")),
     h("p", { class: "muted small" }, "Claude writes the script and fact-checks it with web searches (a few cents). Nothing is narrated or spent on ElevenLabs until you approve the script."));
-  $app.replaceChildren(form, h("h2", {}, "Videos"), h("div", { id: "cards", class: "cards" }, h("p", { class: "muted" }, "Loading…")));
+  $app.replaceChildren(form, h("div", { id: "perf" }), h("h2", {}, "Videos"),
+    h("div", { id: "cards", class: "cards" }, h("p", { class: "muted" }, "Loading…")));
   await refreshProjectCards();
+}
+
+function perfPanel(projects) {
+  const uploaded = projects.filter(p => p.youtube || p.short_youtube);
+  if (!uploaded.length) return null;
+  const fetched = uploaded.map(p => p.stats && p.stats.fetched).filter(Boolean).sort().pop();
+  const rows = uploaded.map(p => ({ p, v: (p.stats && p.stats.video) || {}, s: (p.stats && p.stats.short) || {} }))
+    .sort((a, b) => (b.v.views || 0) - (a.v.views || 0));
+  const num = x => (x == null ? "–" : Number(x).toLocaleString());
+  const dur = s => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+  const btn = h("button", { class: "small", onclick: async () => {
+    try {
+      const job = await api("POST", "/api/stats/refresh");
+      btn.disabled = true; btn.textContent = "Refreshing…";
+      follow(job, null, () => refreshProjectCards());
+    } catch (e) { toast(e.message, true); }
+  } }, "Refresh statistics");
+  return h("div", { class: "panel" },
+    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, "How your videos are doing"),
+      h("div", { class: "row" }, h("span", { class: "muted small" }, fetched ? `Updated ${ago(Date.parse(fetched) / 1000)}` : "Not fetched yet"), btn)),
+    h("div", { class: "tablewrap" }, h("table", { class: "stats" },
+      h("tr", {}, ["Video", "Views", "Watch time", "Average view", "Likes", "Short views"].map(t => h("th", {}, t))),
+      rows.map(({ p, v, s }) => h("tr", {},
+        h("td", {}, h("a", { href: `#/p/${p.slug}` }, p.title)),
+        h("td", {}, p.youtube ? num(v.views) : "–"),
+        h("td", {}, v.minutes_watched == null ? "–" : `${(v.minutes_watched / 60).toFixed(1)} h`),
+        h("td", {}, v.avg_view_seconds == null ? "–"
+          : `${dur(v.avg_view_seconds)}${v.avg_view_percent != null ? ` (${Math.round(v.avg_view_percent)}%)` : ""}`),
+        h("td", {}, p.youtube ? num(v.likes) : "–"),
+        h("td", {}, p.short_youtube ? num(s.views) : "–"))))),
+    h("p", { class: "muted small" }, "Views and likes are live. Watch time and average view come from YouTube Analytics, which lags a day or two."));
 }
 
 async function refreshProjectCards() {
   const box = document.getElementById("cards");
   if (!box) return;
   const projects = await api("GET", "/api/projects");
+  const perf = document.getElementById("perf");
+  const panel = perfPanel(projects);
+  if (perf) perf.replaceChildren(...(panel ? [panel] : []));
   if (!projects.length) {
     box.replaceChildren(h("p", { class: "muted" }, "No videos yet. Start one above, or from the topic queue."));
     return;
@@ -259,8 +294,19 @@ async function saveDraft() {
   } catch (e) { toast(e.message, true); return false; }
 }
 
-async function startJob(action, extra, confirmText) {
-  if (confirmText && !confirm(confirmText)) return;
+// What is left on the ElevenLabs plan, as a sentence for cost confirmations ("" if it cannot be read)
+async function usageNote(chars) {
+  try {
+    const u = await api("GET", "/api/elevenlabs");
+    if (u.error || !u.limit) return "";
+    const resets = u.resets ? ` (resets ${new Date(u.resets * 1000).toLocaleDateString()})` : "";
+    const over = chars > u.left ? "\n\nThat is more than you have left: ElevenLabs will refuse the rest or bill extra, depending on your plan." : "";
+    return `\n\nYou have ${u.left.toLocaleString()} of ${u.limit.toLocaleString()} characters left this month${resets}.${over}`;
+  } catch (e) { return ""; }
+}
+
+async function startJob(action, extra, confirmText, chars) {
+  if (confirmText && !confirm(confirmText + (chars ? await usageNote(chars) : ""))) return;
   try {
     if (S.dirty && !(await saveDraft())) return;
     const job = await api("POST", `/api/projects/${encodeURIComponent(S.slug)}/jobs`, Object.assign({ action }, extra || {}));
@@ -300,7 +346,7 @@ function updateJobBanner() {
 function renderProject() {
   const p = S.project;
   if (!p) return;
-  const tabs = [["script", "Script"], ["visuals", "Visuals"], ["video", "Video"], ["log", "Log"]];
+  const tabs = [["script", "Script"], ["visuals", "Visuals"], ["video", "Video"], ["short", "Short"], ["log", "Log"]];
   $app.replaceChildren(
     h("div", { class: "row between" },
       h("div", {}, h("h1", {}, (S.draft && S.draft.title) || p.title),
@@ -310,7 +356,8 @@ function renderProject() {
     h("div", { id: "jobbanner", hidden: true }),
     nextStep(p),
     h("nav", { class: "tabs" }, tabs.map(([k, label]) => h("a", { href: `#/p/${p.slug}/${k}`, class: S.tab === k ? "active" : "" }, label))),
-    h("div", { id: "tabbody" }, S.tab === "visuals" ? visualsTab(p) : S.tab === "video" ? videoTab(p) : S.tab === "log" ? logTab(p) : scriptTab(p)));
+    h("div", { id: "tabbody" }, S.tab === "visuals" ? visualsTab(p) : S.tab === "video" ? videoTab(p)
+      : S.tab === "short" ? shortTab(p) : S.tab === "log" ? logTab(p) : scriptTab(p)));
   updateJobBanner();
   if (S.dirty) showSaveBar();
 }
@@ -339,12 +386,12 @@ function nextStep(p) {
     case "review":
       return box("", "Review the script and the fact-check below. When you are happy with it, generate the voiceover.",
         h("button", { class: "primary", onclick: () => startJob("voiceover", null,
-          `ElevenLabs will narrate ${p.voice_todo.length} scene(s), ${p.voice_todo_chars} characters. Continue?`) },
+          `ElevenLabs will narrate ${p.voice_todo.length} scene(s), ${p.voice_todo_chars} characters. Continue?`, p.voice_todo_chars) },
           `Approve and generate voiceover (${p.voice_todo_chars} characters)`));
     case "voiceover":
       return box("warn", `${p.voice_todo.length} scene(s) have new or changed narration (${p.voice_todo_chars} characters).`,
         h("button", { class: "primary", onclick: () => startJob("voiceover", null,
-          `ElevenLabs will narrate ${p.voice_todo.length} scene(s), ${p.voice_todo_chars} characters. Continue?`) },
+          `ElevenLabs will narrate ${p.voice_todo.length} scene(s), ${p.voice_todo_chars} characters. Continue?`, p.voice_todo_chars) },
           `Generate voiceover (${p.voice_todo_chars} characters)`));
     case "visuals":
       return box("", `${p.visuals_ready} of ${p.scenes} scenes have a visual.`,
@@ -461,7 +508,8 @@ function sceneEditor(s, i) {
       info && info.audio.url ? h("audio", { controls: true, preload: "none", src: info.audio.url }) : null,
       h("div", { class: "tools" },
         state === "voiced" ? h("button", { class: "small", title: "Generate this clip again with the same text", onclick: () =>
-          startJob("revoice", { scene: i }, `Re-voice scene ${i + 1}? ElevenLabs will narrate ${s.narration.trim().length} characters again.`) }, "Re-voice") : null,
+          startJob("revoice", { scene: i }, `Re-voice scene ${i + 1}? ElevenLabs will narrate ${s.narration.trim().length} characters again.`,
+            s.narration.trim().length) }, "Re-voice") : null,
         h("button", { class: "small", title: "Move up", disabled: i === 0, onclick: () => move(-1) }, "↑"),
         h("button", { class: "small", title: "Move down", disabled: i === n - 1, onclick: () => move(1) }, "↓"),
         h("button", { class: "small", title: "Add a scene below", onclick: () => {
@@ -636,8 +684,9 @@ function videoTab(p) {
         h("tr", {}, h("td", {}, "Voiceover"), h("td", {}, voiceText)),
         h("tr", {}, h("td", {}, "Visuals"), h("td", {}, `${p.visuals_ready} of ${p.scenes} scenes`)),
         h("tr", {}, h("td", {}, "Video"), h("td", {}, videoText)),
+        h("tr", {}, h("td", {}, "Music"), h("td", {}, musicPicker(p))),
         h("tr", {}, h("td", {}, "Sound"), h("td", {}, `Voice tone ${st.settings.VOICE_TONE || "soft"}, `,
-          st.settings.MUSIC_PATH ? `music at ${Math.round((st.settings.MUSIC_VOLUME || 0) * 100)}% (${Math.round(-20 * Math.log10(st.settings.MUSIC_VOLUME || 0.1))} dB below the voice)` : "no music",
+          `music level ${Math.round((st.settings.MUSIC_VOLUME || 0) * 100)}% (${Math.round(-20 * Math.log10(st.settings.MUSIC_VOLUME || 0.1))} dB below the voice)`,
           " · ", h("a", { href: "#/settings" }, "change")))),
       h("div", { class: "row", style: "margin-top:.75rem" },
         h("button", { class: "primary", disabled: p.voice_todo.length > 0, onclick: () => startJob("render") },
@@ -652,7 +701,31 @@ function videoTab(p) {
         h("a", { class: "btn small", href: p.final_url, download: `${p.slug}.mp4` }, "Download MP4"),
         p.captions_url ? h("a", { class: "btn small", href: p.captions_url, download: `${p.slug}.srt` }, "Download captions") : null)) : null,
     thumbnailPanel(p),
-    uploadPanel(p, st));
+    uploadPanel(p, st, "video"));
+}
+
+function trackName(path) { return String(path).split("/").pop(); }
+
+function musicPicker(p) {
+  const m = p.music || {};
+  const names = ((S.status && S.status.music_files) || []).map(trackName);
+  const explicit = m.choice && !m.auto ? m.choice : "";
+  const defaultLabel = explicit
+    ? `Default (${m.default})`
+    : `Default: ${m.track || "no music"}${m.auto ? " (picked for this video)" : ""}`;
+  const select = h("select", { onchange: async e => {
+    try {
+      S.project = await api("PUT", `/api/projects/${encodeURIComponent(p.slug)}/music`, { music: e.target.value || null });
+      renderProject();
+      toast("Music changed. Render again to hear it; only the sound is re-mixed, which takes about a minute.");
+    } catch (err) { toast(err.message, true); renderProject(); }
+  } },
+    h("option", { value: "" }, defaultLabel),
+    h("option", { value: "none", selected: explicit === "none" ? true : null }, "No music"),
+    names.map(n => h("option", { value: n, selected: explicit === n ? true : null }, n)));
+  return h("div", { class: "row" }, select,
+    m.track ? h("audio", { controls: true, preload: "none", src: `/music/${encodeURIComponent(m.track)}`, class: "mini" }) : null,
+    h("a", { class: "small", href: "#/settings" }, "Music library"));
 }
 
 function thumbnailPanel(p) {
@@ -669,29 +742,88 @@ function thumbnailPanel(p) {
       h("button", { disabled: p.video === "missing", onclick: () => startJob("thumbnail") }, "Save and update thumbnail")));
 }
 
-function uploadPanel(p, st) {
-  if (p.youtube) {
-    return h("div", { class: "panel" }, h("h2", {}, "YouTube"),
-      h("p", {}, "Uploaded ", ago(Date.parse(p.youtube.uploaded_at) / 1000), ": ", h("a", { href: p.youtube.url, target: "_blank", rel: "noopener" }, p.youtube.url)),
-      h("p", { class: "muted small" }, "To upload a new version, delete youtube.json from the project folder (and the old video in YouTube Studio)."));
+function uploadPanel(p, st, kind) {
+  const isShort = kind === "short";
+  const yt = isShort ? p.short.youtube : p.youtube;
+  const ready = isShort ? p.short.state === "ready" : p.video === "ready";
+  const what = isShort ? "the Short" : "the video";
+  if (yt) {
+    return h("div", { class: "panel" }, h("h2", {}, isShort ? "Short on YouTube" : "YouTube"),
+      h("p", {}, "Uploaded ", ago(Date.parse(yt.uploaded_at) / 1000), ": ", h("a", { href: yt.url, target: "_blank", rel: "noopener" }, yt.url)),
+      h("p", { class: "muted small" }, `To upload a new version, delete ${isShort ? "short/youtube.json" : "youtube.json"} from the project folder (and the old one in YouTube Studio).`));
   }
   const privacy = h("select", {}, ["private", "unlisted", "public"].map(v => h("option", { value: v }, v)));
   const when = h("input", { type: "datetime-local" });
   const synthetic = h("input", { type: "checkbox" });
   const warn = !st.keys.youtube_client ? "client_secret.json is missing, so uploading is not set up (see the README)."
     : !st.keys.youtube_login ? "Sign in to YouTube once from a terminal with: .venv/bin/python pipeline.py --login" : null;
-  return h("div", { class: "panel stack" }, h("h2", {}, "Upload to YouTube"),
+  return h("div", { class: "panel stack" }, h("h2", {}, isShort ? "Upload the Short" : "Upload to YouTube"),
     warn ? h("div", { class: "callout warn panel" }, warn) : null,
+    isShort && !p.youtube ? h("p", { class: "muted small" }, "Tip: upload the full video first, so the Short's description can link to it.") : null,
     h("div", { class: "field-grid" },
       h("label", {}, h("span", {}, "Privacy"), privacy),
       h("label", {}, h("span", {}, "Schedule (optional, your local time)"), when),
       h("label", { class: "row" }, synthetic, h("span", { style: "margin:0" }, "Contains realistic AI-generated visuals"))),
-    h("p", { class: "muted small" }, "Scheduled videos upload as private and go public at that time. Watch the result in YouTube Studio before it goes live."),
-    h("button", { class: "primary", disabled: p.video !== "ready" || !!warn, onclick: () => {
+    h("p", { class: "muted small" }, "Scheduled uploads stay private and go public at that time. Watch the result in YouTube Studio before it goes live."),
+    h("button", { class: "primary", disabled: !ready || !!warn, onclick: () => {
       const extra = { privacy: privacy.value, synthetic: synthetic.checked };
       if (when.value) extra.publish_at = new Date(when.value).toISOString();
-      startJob("upload", extra, `Upload “${p.title}” to YouTube as ${extra.publish_at ? "private, scheduled" : privacy.value}?`);
-    } }, p.video === "ready" ? "Upload" : "Render the video first"));
+      startJob(isShort ? "upload_short" : "upload", extra,
+        `Upload ${isShort ? "the Short for " : ""}“${p.title}” to YouTube as ${extra.publish_at ? "private, scheduled" : privacy.value}?`);
+    } }, ready ? "Upload" : isShort ? "Make the Short first" : "Render the video first"));
+}
+
+// ---------------------------------------------------------------- short tab
+function shortTab(p) {
+  const sh = p.short;
+  if (!sh || !p.script) return h("p", { class: "muted" }, "No script yet.");
+  const st = S.status || { keys: {}, settings: {} };
+  const scenes = p.script.scenes;   // the saved script: scene numbers must match the server's
+  const secs = sh.scene_seconds;
+  const v = { first: sh.first, last: sh.last, title: sh.title };
+  const label = i => `${i + 1}. ${scenes[i].narration.slice(0, 60)}${scenes[i].narration.length > 60 ? "…" : ""}`;
+  const total = h("strong", {});
+  const note = h("span", { class: "small" });
+  const update = () => {
+    const t = secs.slice(v.first, v.last + 1).reduce((a, b) => a + b, 0);
+    total.textContent = `${Math.round(t)} s`;
+    note.className = "small " + (t > sh.max_seconds ? "warn-text" : "muted");
+    note.textContent = t > sh.max_seconds ? ` YouTube Shorts can be at most ${sh.max_seconds / 60} minutes; pick fewer scenes.`
+      : t > sh.target_seconds ? " Longer than a minute is allowed, but under 60 s usually does better." : " Good length for a Short.";
+  };
+  const firstSel = h("select", { onchange: e => { v.first = Number(e.target.value); if (v.last < v.first) { v.last = v.first; lastSel.value = v.last; } update(); } },
+    scenes.map((_, i) => h("option", { value: i, selected: i === v.first ? true : null }, label(i))));
+  const lastSel = h("select", { onchange: e => { v.last = Number(e.target.value); if (v.first > v.last) { v.first = v.last; firstSel.value = v.first; } update(); } },
+    scenes.map((_, i) => h("option", { value: i, selected: i === v.last ? true : null }, label(i))));
+  const title = h("input", { value: v.title, maxlength: 90, style: "width:100%", oninput: e => { v.title = e.target.value; } });
+  update();
+  const saveShort = async () => {
+    if (v.first === sh.first && v.last === sh.last && v.title === sh.title) return true;
+    try { S.project = await api("PUT", `/api/projects/${encodeURIComponent(p.slug)}/short`, v); return true; }
+    catch (e) { toast(e.message, true); return false; }
+  };
+  const stateText = { ready: "Up to date", outdated: "Out of date with your latest changes", missing: "Not made yet" }[sh.state];
+  return h("div", {},
+    h("div", { class: "panel stack" },
+      h("h2", {}, "Short (vertical, up to a minute)"),
+      h("p", { class: "muted small" }, "Made from a run of scenes in this video: the same narration and visuals, cropped to 9:16, with large captions and the title at the top. It costs nothing extra: no new narration."),
+      h("div", { class: "field-grid" },
+        h("label", {}, h("span", {}, "From scene"), firstSel),
+        h("label", {}, h("span", {}, "To scene"), lastSel),
+        h("label", { style: "grid-column:1/-1" }, h("span", {}, "Title shown at the top (and used on YouTube)"), title)),
+      h("div", {}, "Length: ", total, note),
+      h("div", { class: "row" },
+        h("button", { class: "primary", disabled: p.voice_todo.length > 0, onclick: async () => {
+          if (await saveShort()) startJob("short");
+        } }, sh.state === "missing" ? "Make the Short" : "Save and make again"),
+        h("button", { onclick: async () => { if (await saveShort()) { renderProject(); toast("Saved"); } } }, "Save"),
+        h("span", { class: "muted small" }, stateText),
+        p.voice_todo.length ? h("span", { class: "warn-text small" }, "Generate the voiceover first.") : null)),
+    sh.url ? h("div", { class: "panel" },
+      h("video", { class: "player vertical", controls: true, preload: "metadata", src: sh.url }),
+      h("div", { class: "row", style: "margin-top:.5rem" },
+        h("a", { class: "btn small", href: sh.url, download: `${p.slug}-short.mp4` }, "Download MP4"))) : null,
+    uploadPanel(p, st, "short"));
 }
 
 // ---------------------------------------------------------------- log tab
@@ -759,6 +891,7 @@ function renderQueue(q) {
 // ---------------------------------------------------------------- settings
 async function showSettings() {
   S.status = await api("GET", "/api/status");
+  S.music = await api("GET", "/api/music");
   const projects = await api("GET", "/api/projects");
   renderSettings(projects.filter(p => p.voice_todo.length < p.scenes));
 }
@@ -781,10 +914,12 @@ function renderSettings(voiced) {
     st.problems.length ? h("div", { class: "panel callout bad" }, h("strong", {}, "Problems: "), st.problems.join("; ")) : null,
     h("div", { class: "panel stack" }, h("h2", {}, "Sound"),
       h("div", { class: "field-grid" },
-        h("label", {}, h("span", {}, "Background music (files in the music folder)"),
+        h("label", {}, h("span", {}, "Background music for videos without their own choice"),
           h("select", { onchange: e => { vals.MUSIC_PATH = e.target.value; } },
             h("option", { value: "" }, "No music"),
-            st.music_files.map(f => h("option", { value: f, selected: f === v.MUSIC_PATH ? true : null }, f.replace(/^music\//, ""))))),
+            st.music_files.length ? h("option", { value: st.music_library, selected: v.MUSIC_PATH === st.music_library ? true : null },
+              `A different track for each video (${st.music_files.length} in ${st.music_library}/)`) : null,
+            st.music_files.map(f => h("option", { value: f, selected: f === v.MUSIC_PATH ? true : null }, `Always ${trackName(f)}`)))),
         h("label", {}, h("span", {}, "Music level ", level),
           h("input", { type: "range", min: 0.01, max: 0.3, step: 0.01, value: v.MUSIC_VOLUME, style: "width:100%",
             oninput: e => { vals.MUSIC_VOLUME = Number(e.target.value); level.textContent = dbText(vals.MUSIC_VOLUME); } })),
@@ -808,6 +943,7 @@ function renderSettings(voiced) {
             });
           } catch (e) { toast(e.message, true); }
         } }, "Save and preview 45 s"), previewPlayer) : h("p", { class: "muted small" }, "Previews need a video with a voiceover.")),
+    musicLibraryPanel(voiced),
     h("div", { class: "panel stack" }, h("h2", {}, "Voice generation (ElevenLabs)"),
       h("div", { class: "field-grid" },
         h("label", {}, h("span", {}, "Stability (0-1, higher is calmer and steadier)"), num("VOICE_STABILITY", 0, 1, 0.05)),
@@ -823,12 +959,49 @@ function renderSettings(voiced) {
     statusPanel(st));
 }
 
+function musicLibraryPanel(voiced) {
+  const lib = S.music || { tracks: [], library: "music" };
+  const file = h("input", { type: "file", accept: "audio/*", hidden: true, onchange: async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+      toast("Adding the track…");
+      S.music = await api("POST", "/api/music", fd, true);
+      S.status = await api("GET", "/api/status");
+      renderSettings(voiced);
+      toast(`${f.name} added to ${S.music.library}/`);
+    } catch (err) { toast(err.message, true); }
+  } });
+  return h("div", { class: "panel stack" }, h("h2", {}, "Music library"),
+    h("p", { class: "muted small" }, `Tracks in ${lib.library}/. Each video can use its own track (Video tab), or take the default above. `,
+      "With “a different track for each video”, a new video gets the track used least so far and keeps it. Use only music you have the rights to, such as the YouTube Audio Library."),
+    lib.tracks.length ? h("div", {}, lib.tracks.map(t => h("div", { class: "queue-item" },
+      h("span", { class: "t" }, t.name, h("div", { class: "muted small" }, t.videos ? `chosen by ${t.videos} video(s)` : "not chosen by any video yet")),
+      h("audio", { controls: true, preload: "none", src: t.url, class: "mini" })))) : h("p", { class: "muted" }, "No tracks yet."),
+    h("div", { class: "row" }, h("button", { onclick: () => file.click() }, "Add a track…"), file));
+}
+
+function usageCell() {
+  const cell = h("span", { class: "muted small" }, "Checking…");
+  api("GET", "/api/elevenlabs?refresh=1").then(u => {
+    if (u.error) { cell.replaceChildren(chip("unknown", "warn"), " ", h("span", { class: "muted small" }, u.error)); return; }
+    const pct = u.limit ? Math.round(100 * u.left / u.limit) : 0;
+    const resets = u.resets ? `, resets ${new Date(u.resets * 1000).toLocaleDateString()}` : "";
+    cell.replaceChildren(chip(`${u.left.toLocaleString()} of ${u.limit.toLocaleString()} left`, pct < 15 ? "bad" : pct < 35 ? "warn" : "ok"),
+      h("span", { class: "muted small" }, ` (${u.used.toLocaleString()} used this month${resets}; a 6-minute video is about 5,500)`));
+  }).catch(e => cell.replaceChildren(chip("unknown", "warn"), " ", e.message));
+  return cell;
+}
+
 function statusPanel(st) {
   const yes = ok => (ok ? chip("set", "ok") : chip("missing", "bad"));
   return h("div", { class: "panel", style: "margin-top:1rem" }, h("h2", {}, "Setup"),
     h("table", { class: "kv" },
       h("tr", {}, h("td", {}, "Claude API key"), h("td", {}, yes(st.keys.anthropic))),
       h("tr", {}, h("td", {}, "ElevenLabs key and voice"), h("td", {}, yes(st.keys.elevenlabs && st.keys.voice_id))),
+      h("tr", {}, h("td", {}, "ElevenLabs characters"), h("td", {}, usageCell())),
       h("tr", {}, h("td", {}, "Stock footage"), h("td", {}, st.stock_providers.length ? st.stock_providers.join(", ") : chip("none: NASA images only", "warn"))),
       h("tr", {}, h("td", {}, "YouTube"), h("td", {}, st.keys.youtube_client ? (st.keys.youtube_login ? chip("signed in", "ok") : chip("not signed in: run pipeline.py --login", "warn")) : chip("client_secret.json missing", "bad"))),
       h("tr", {}, h("td", {}, "Models"), h("td", {}, `writer ${st.models.writer}, fact-check ${st.models.factcheck}, voice ${st.models.voice}`)),

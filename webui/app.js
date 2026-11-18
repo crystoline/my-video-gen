@@ -354,7 +354,8 @@ async function saveDraft() {
   const d = S.draft;
   const script = {
     title: d.title || "", description: d.description || "", tags: d.tags || [], thumbnail_text: d.thumbnail_text || "",
-    scenes: d.scenes.map(s => ({ narration: s.narration, visual: { source: s.visual.source, query: s.visual.query } })),
+    scenes: d.scenes.map(s => ({ narration: s.narration, visual: { source: s.visual.source, query: s.visual.query },
+      callout: s.callout && s.callout.text ? s.callout : null, chart: s.chart || null })),
   };
   const ti = d._thumbScene ? d.scenes.indexOf(d._thumbScene) : -1;
   if (ti >= 0) script.thumbnail_scene = ti;
@@ -508,6 +509,9 @@ function scriptTab(p) {
     h("div", { id: "scenes" }, d.scenes.map((s, i) => sceneEditor(s, i))),
     h("div", { class: "panel row", style: "margin-top:1rem" },
       h("button", { onclick: () => startJob("factcheck", null, "Run the fact-check again on the saved script? This uses Claude and web searches (a few cents).") }, "Fact-check again"),
+      h("button", { title: "Claude picks each scene's key fact to show on screen, and proposes charts where the narration compares amounts",
+        onclick: () => startJob("extras", null, "Let Claude suggest on-screen text and charts (about a cent)? Scenes that already have them keep yours.") },
+        "Suggest on-screen text and charts"),
       h("button", { class: "danger", onclick: () => {
         const m = prompt("Rewrite the whole script from scratch? Current narration clips and visuals move to the project's .trash folder.\n\nTarget length in minutes:", "6");
         if (m) startJob("rewrite", { minutes: Number(m) });
@@ -655,6 +659,11 @@ function sceneEditor(s, i) {
     ta,
     h("div", { class: "visual-row" }, stats),
     h("div", { class: "visual-row" },
+      h("input", { value: (s.callout && s.callout.text) || "", maxlength: 32, placeholder: "On-screen text (optional), e.g. 4 cm a year",
+        oninput: e => { s.callout = Object.assign({ anchor: "" }, s.callout, { text: e.target.value }); markDirty(); } }),
+      h("input", { value: (s.callout && s.callout.anchor) || "", maxlength: 40, placeholder: "…appears at the word", style: "flex:0 1 180px",
+        oninput: e => { s.callout = Object.assign({ text: "" }, s.callout, { anchor: e.target.value }); markDirty(); } })),
+    h("div", { class: "visual-row" },
       h("select", { onchange: e => { s.visual.source = e.target.value; markDirty(); } },
         Object.entries(SOURCES).map(([k, label]) => h("option", { value: k, selected: s.visual.source === k ? true : null }, label))),
       h("input", { value: s.visual.query, placeholder: "Visual search words, e.g. aurora night sky", maxlength: 100,
@@ -741,7 +750,42 @@ function visualCard(s, i) {
         h("button", { class: "small", onclick: () => file.click() }, "Upload my own"), file,
         a ? h("button", { class: "small", disabled: isThumb, onclick: () => {
           d._thumbScene = s; markDirty(); renderProject();
-        } }, "Use for thumbnail") : null)));
+        } }, "Use for thumbnail") : null),
+      h("div", { class: "row" },
+        s.chart ? chip(`chart: ${s.chart.title || "untitled"}`, a && a.source === "chart" ? "ok" : "accent") : null,
+        h("button", { class: "small", onclick: () => openChartEditor(s) }, s.chart ? "Edit chart" : "Make a chart"),
+        s.chart ? h("button", { class: "small", onclick: () => startJob("use_chart", { scene: i }) },
+          a && a.source === "chart" ? "Redraw chart" : "Use chart as visual") : null)));
+}
+
+// A small editor for a scene's bar chart (title, unit, bars). Saved with the script.
+function openChartEditor(s) {
+  const c = JSON.parse(JSON.stringify(s.chart || { title: "", unit: "", items: [{ label: "", value: 0 }, { label: "", value: 0 }] }));
+  const overlay = h("div", { class: "modal-back", onclick: e => { if (e.target === overlay) overlay.remove(); } });
+  const rows = h("div", { class: "stack" });
+  const drawRows = () => rows.replaceChildren(...c.items.map((it, k) => h("div", { class: "row" },
+    h("input", { class: "grow", value: it.label, maxlength: 24, placeholder: "Label", oninput: e => { it.label = e.target.value; } }),
+    h("input", { type: "number", value: it.value, step: "any", style: "width:9rem", oninput: e => { it.value = Number(e.target.value); } }),
+    h("button", { class: "small danger", disabled: c.items.length <= 2, onclick: () => { c.items.splice(k, 1); drawRows(); } }, "✕"))));
+  drawRows();
+  overlay.append(h("div", { class: "modal panel", style: "max-width:640px" },
+    h("h2", {}, "Bar chart"),
+    h("p", { class: "muted small" }, "Use only numbers stated in the narration. The chart becomes the scene's picture when you click “Use chart as visual”."),
+    h("div", { class: "field-grid" },
+      h("label", {}, h("span", {}, "Title"), h("input", { value: c.title, maxlength: 60, style: "width:100%", oninput: e => { c.title = e.target.value; } })),
+      h("label", {}, h("span", {}, "Unit (optional)"), h("input", { value: c.unit, maxlength: 12, style: "width:100%", oninput: e => { c.unit = e.target.value; } }))),
+    rows,
+    h("div", { class: "row" },
+      h("button", { class: "small", disabled: c.items.length >= 8, onclick: () => { c.items.push({ label: "", value: 0 }); drawRows(); } }, "+ Bar"),
+      h("span", { class: "grow" }),
+      s.chart ? h("button", { class: "danger", onclick: () => { delete s.chart; markDirty(); overlay.remove(); renderProject(); } }, "Remove chart") : null,
+      h("button", { onclick: () => overlay.remove() }, "Cancel"),
+      h("button", { class: "primary", onclick: () => {
+        const items = c.items.filter(it => it.label.trim() && isFinite(it.value) && it.value >= 0);
+        if (items.length < 2) { toast("A chart needs at least two bars with a label and a number", true); return; }
+        s.chart = Object.assign(c, { items }); markDirty(); overlay.remove(); renderProject();
+      } }, "Done"))));
+  document.body.append(overlay);
 }
 
 // ---------------------------------------------------------------- visual picker
@@ -1270,6 +1314,8 @@ function renderSettings(voiced) {
       h("p", { class: "muted small" }, "These only affect narration generated after you save. To hear them on an existing scene, use Re-voice on the Script tab (it costs that scene's characters).")),
     h("div", { class: "panel stack" }, h("h2", {}, "Video"),
       h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1)),
+      h("label", { class: "row" }, h("input", { type: "checkbox", checked: v.CALLOUTS, onchange: e => { vals.CALLOUTS = e.target.checked; } }),
+        h("span", { style: "margin:0" }, "Show each scene's on-screen text (set on the Script tab) in the video")),
       h("label", { class: "row" }, h("input", { type: "checkbox", checked: v.AUTO_CHAPTERS, onchange: e => { vals.AUTO_CHAPTERS = e.target.checked; } }),
         h("span", { style: "margin:0" }, "Chapters: when a video renders without chapters, Claude suggests them (about a cent)")),
       h("label", {}, h("span", {}, "Extra shots for long scenes (keeps the picture moving; extra visuals are fetched automatically)"),

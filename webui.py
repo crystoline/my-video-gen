@@ -363,9 +363,15 @@ def clean_script(new: dict, old: dict) -> dict:
         source = visual.get("source")
         if source not in SOURCES:
             raise ValueError(f"Scene {k}: visual source must be one of {', '.join(SOURCES)}")
-        out_scenes.append({"narration": text(s.get("narration"), f"Scene {k} narration", 2000, True),
-                           "visual": {"source": source,
-                                      "query": text(visual.get("query", ""), f"Scene {k} visual search", 100, True)}})
+        scene = {"narration": text(s.get("narration"), f"Scene {k} narration", 2000, True),
+                 "visual": {"source": source,
+                            "query": text(visual.get("query", ""), f"Scene {k} visual search", 100, True)}}
+        callout, chart = pl.clean_callout(s.get("callout")), pl.clean_chart(s.get("chart"))
+        if callout:
+            scene["callout"] = callout
+        if chart:
+            scene["chart"] = chart
+        out_scenes.append(scene)
     tags = new.get("tags", [])
     if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
         raise ValueError("Tags must be a list of text")
@@ -594,11 +600,29 @@ def job_render(slug: str) -> None:
     (p / ".approved").touch()
     timeline = pl.make_voiceover(p, script)   # nothing to synthesize; this only measures the clips
     assets = pl.gather_visuals(p, script, timeline)
-    pl.assemble(p, timeline, assets)
+    pl.assemble(p, timeline, assets, script)
     pl.write_srt(p, script, timeline)
     pl.ensure_chapters(p, script, timeline)
     pl.make_thumbnail(p, script, timeline, assets)
     pl.log("Captions and thumbnail updated")
+
+
+def job_extras(slug: str) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    added = pl.suggest_extras(script)
+    pl.save_json(p / "script.json", script)
+    pl.log(f"Suggested {added['callouts']} on-screen text(s) and {added['charts']} chart(s); "
+           "scenes that already had them were left alone")
+
+
+def job_use_chart(slug: str, scene: int) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    chart = script["scenes"][scene].get("chart")
+    if not chart:
+        raise RuntimeError(f"Scene {scene + 1} has no chart yet")
+    pl.use_chart(p, scene, chart)
 
 
 def job_chapters(slug: str) -> None:
@@ -875,6 +899,7 @@ ACTIONS = {
     "short": ("Make the Short", job_short),
     "chapters": ("Suggest chapters", job_chapters),
     "translate": ("Translate the captions", job_translate),
+    "extras": ("Suggest on-screen text and charts", job_extras),
 }
 
 
@@ -916,6 +941,11 @@ def api_start_job(slug):
     elif action == "find_visual":
         i = scene_index()
         job = enqueue(slug, action, f"Find another visual for scene {i + 1}", job_find_visual, slug=slug, scene=i)
+    elif action == "use_chart":
+        i = scene_index()
+        if not script["scenes"][i].get("chart"):
+            raise ValueError(f"Scene {i + 1} has no chart yet")
+        job = enqueue(slug, action, f"Use the chart for scene {i + 1}", job_use_chart, slug=slug, scene=i)
     elif action == "dub":
         language = str(data.get("language") or "")
         if language not in pl.LANGUAGES:
@@ -1253,7 +1283,7 @@ SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float", "SHOT_SECONDS": "float",
-    "AUTO_CHAPTERS": "bool", "CAPTION_LANGUAGES": "languages",
+    "AUTO_CHAPTERS": "bool", "CAPTION_LANGUAGES": "languages", "CALLOUTS": "bool",
     "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
     "AI_VISUALS": "choice", "AI_IMAGE_MODEL": "text", "AI_VIDEO_MODEL": "text", "AI_IMAGE_COST": "float",
     "AI_VIDEO_COST": "float",
@@ -1283,7 +1313,7 @@ def current_settings() -> dict:
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
             "CROSSFADE": pl.CROSSFADE, "SHOT_SECONDS": pl.SHOT_SECONDS, "AUTO_CHAPTERS": pl.AUTO_CHAPTERS,
-            "CAPTION_LANGUAGES": pl.CAPTION_LANGUAGES,
+            "CAPTION_LANGUAGES": pl.CAPTION_LANGUAGES, "CALLOUTS": pl.CALLOUTS,
             "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
             "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK, "AI_VISUALS": pl.AI_VISUALS,
             "AI_IMAGE_MODEL": pl.AI_IMAGE_MODEL, "AI_VIDEO_MODEL": pl.AI_VIDEO_MODEL,

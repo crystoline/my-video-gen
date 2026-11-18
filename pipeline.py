@@ -86,7 +86,7 @@ def configure() -> None:
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
     global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
     global FAL_KEY, AI_VISUALS, AI_IMAGE_MODEL, AI_VIDEO_MODEL, AI_IMAGE_COST, AI_VIDEO_COST
-    global RENDER_JOBS, SHOT_SECONDS, AUTO_CHAPTERS, CAPTION_LANGUAGES, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    global RENDER_JOBS, SHOT_SECONDS, AUTO_CHAPTERS, CAPTION_LANGUAGES, CALLOUTS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
     FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
@@ -125,6 +125,7 @@ def configure() -> None:
     RENDER_JOBS = int(os.getenv("RENDER_JOBS") or 0)   # scenes rendered at once; 0 = automatic
     SHOT_SECONDS = float(os.getenv("SHOT_SECONDS") or 0)   # a long scene gets a new shot about this often; 0 = off
     AUTO_CHAPTERS = _flag("AUTO_CHAPTERS", True)   # Claude suggests chapters at render time if there are none
+    CALLOUTS = _flag("CALLOUTS", True)   # show each scene's on-screen text (if it has one) in the video
     # Extra caption languages: translated captions, title and description are added to uploaded videos
     CAPTION_LANGUAGES = [c.strip() for c in os.getenv("CAPTION_LANGUAGES", "").split(",") if c.strip()]
     YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
@@ -1757,27 +1758,32 @@ def _shot_chain(asset: dict, frames: int, w: int, h: int, index: int) -> str:
 
 
 def render_scene(asset: dict, frames: int, out: Path, index: int, size: tuple[int, int] | None = None,
-                 keyframes: tuple[int, ...] | list[int] = (), shots: list[dict] | None = None) -> None:
+                 keyframes: tuple[int, ...] | list[int] = (), shots: list[dict] | None = None,
+                 overlay: str | None = None) -> None:
     """Render one scene's visual to exactly `frames` frames. `keyframes` are frame numbers where the
     segment will later be cut without re-encoding (where its cross-fades start and end). With `shots`
-    (several visuals), the scene shows each in turn, split evenly, as one segment."""
+    (several visuals), the scene shows each in turn, split evenly, as one segment. `overlay` names a subtitle
+    file in the segment's folder (the scene's on-screen callout) to burn in."""
     w, h = size or (W, H)
+    out = Path(out).resolve()   # FFmpeg runs in the segment folder when there is an overlay
+    burn = f",subtitles={overlay}" if overlay else ""
     if shots and len(shots) > 1:
         n = len(shots)
         counts = [frames // n] * (n - 1) + [frames - frames // n * (n - 1)]
         inputs, chains = [], []
         for k, (shot, count) in enumerate(zip(shots, counts)):
-            inputs += (["-i", shot["path"]] if shot["kind"] == "image" else ["-stream_loop", "-1", "-i", shot["path"]])
-            chains.append(f"[{k}:v]{_shot_chain(shot, count, w, h, index + k)}[s{k}]")
-        graph = ";".join(chains) + ";" + "".join(f"[s{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+            path = str(Path(shot["path"]).resolve())
+            inputs += (["-i", path] if shot["kind"] == "image" else ["-stream_loop", "-1", "-i", path])
+            chains.append(f"[{k}:v]{_shot_chain(dict(shot, path=path), count, w, h, index + k)}[s{k}]")
+        graph = ";".join(chains) + ";" + "".join(f"[s{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0{burn}[v]"
         cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", graph, "-map", "[v]", "-an"]
         if keyframes:
             cmd += ["-force_key_frames", "expr:" + "+".join(f"eq(n,{k})" for k in keyframes), "-forced-idr", "1"]
         tmp = out.with_name(out.stem + ".part.mp4")
-        run([*cmd, "-frames:v", frames, *ENCODE, tmp])
+        run([*cmd, "-frames:v", frames, *ENCODE, tmp], cwd=out.parent)
         tmp.replace(out)
         return
-    src = asset["path"]
+    src = str(Path(asset["path"]).resolve())
     if asset["kind"] == "image":
         # Slow "Ken Burns" zoom; alternate zoom-in and zoom-out for variety.
         step = 0.20 / max(frames, 1)
@@ -1785,16 +1791,16 @@ def render_scene(asset: dict, frames: int, out: Path, index: int, size: tuple[in
         vf = (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
               f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
               f":d={frames}:s={w}x{h}:fps={FPS},setsar=1,"
-              f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_BT709}")
+              f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_BT709}{burn}")
         cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf]
     else:
         vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase:in_color_matrix={source_matrix(src)}"
-              f":out_color_matrix=bt709:out_range=tv,crop={w}:{h},fps={FPS},setsar=1,format=yuv420p,{TAG_BT709}")
+              f":out_color_matrix=bt709:out_range=tv,crop={w}:{h},fps={FPS},setsar=1,format=yuv420p,{TAG_BT709}{burn}")
         cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf, "-an"]
     if keyframes:
         cmd += ["-force_key_frames", "expr:" + "+".join(f"eq(n,{k})" for k in keyframes), "-forced-idr", "1"]
     tmp = out.with_name(out.stem + ".part.mp4")   # a half-written file must never look like a finished scene
-    run([*cmd, "-frames:v", frames, *ENCODE, tmp])
+    run([*cmd, "-frames:v", frames, *ENCODE, tmp], cwd=out.parent)
     tmp.replace(out)
 
 
@@ -1942,7 +1948,8 @@ def join_segments(seg_dir: Path, timeline: list[dict], xf: int, out: Path) -> No
 
 
 def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg_dir: Path | None = None,
-                    size: tuple[int, int] | None = None, zoom: list[int] | None = None) -> int:
+                    size: tuple[int, int] | None = None, zoom: list[int] | None = None,
+                    callouts: list | None = None) -> int:
     """Render each scene that is missing, has the wrong length, or whose visual was swapped, several at
     a time. Returns the cross-fade length in frames. `zoom` sets each scene's zoom direction (by default
     its position)."""
@@ -1963,6 +1970,9 @@ def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg
         key = {"frames": want, "keyframes": fade_cuts(i, n, tl["frames"], xf) if xf else [],
                "asset": sigs[0] if len(sigs) == 1 else sigs, "zoom": zoom[i] % 2, "size": list(size),
                "v": RENDER_VERSION}
+        callout = (callouts or [None] * n)[i] if ffmpeg_has_filter("subtitles") else None
+        if callout:   # (only in the key when there is one, so scenes without callouts keep their cache)
+            key["callout"] = [callout["text"], callout["start"], callout["end"]]
         have = index.get(out.stem) or {}
         if out.exists() and have.get("segment") == _file_sig(out) and all(have.get(k) == v for k, v in key.items()):
             continue
@@ -1978,9 +1988,15 @@ def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg
         if workers > 1:
             log(f"Rendering {len(todo)} scene(s), {workers} at a time")
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(render_scene, asset, want, out, zoom[i], size, key["keyframes"],
-                                   scene_shots(asset, timeline[i]["duration"])): (i, out, key)
-                       for i, asset, want, out, key in todo}
+            futures = {}
+            for i, asset, want, out, key in todo:
+                overlay = None
+                if key.get("callout"):
+                    text, start, end = key["callout"]
+                    overlay = write_callout_ass({"text": text, "start": start, "end": end},
+                                                seg_dir / f"callout_{i:02d}.ass", size).name
+                futures[pool.submit(render_scene, asset, want, out, zoom[i], size, key["keyframes"],
+                                    scene_shots(asset, timeline[i]["duration"]), overlay)] = (i, out, key)
             try:
                 for done, future in enumerate(as_completed(futures), start=1):
                     future.result()
@@ -2211,9 +2227,10 @@ def preview_mix(project: Path, out: Path, seconds: float = 45, tone: str | None 
     return out
 
 
-def assemble(project: Path, timeline: list[dict], assets: list[dict]) -> Path:
+def assemble(project: Path, timeline: list[dict], assets: list[dict], script: dict | None = None) -> Path:
     n = len(assets)
-    xf = render_segments(project, timeline, assets)
+    callouts = scene_callouts(project, script, timeline) if script else None
+    xf = render_segments(project, timeline, assets, callouts=callouts)
     video_only = project / "video_only.mp4"
     if join_needed(project / "segments", timeline, video_only):
         join_segments(project / "segments", timeline, xf, video_only)
@@ -2529,6 +2546,197 @@ def ensure_chapters(project: Path, script: dict, timeline: list[dict]) -> None:
         log(f"Note: chapters could not be suggested ({type(e).__name__}: {str(e)[:150]})")
 
 
+# ----------------------------------------------------------------------------
+# On-screen extras: a scene's key fact as a short callout, and bar charts for scenes that compare amounts
+# ----------------------------------------------------------------------------
+class CalloutPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scene: int = Field(description="Scene number, counting from 0")
+    text: str = Field(description="The key fact as it should appear on screen, at most 28 characters, e.g. '4 cm a year'")
+    anchor: str = Field(description="The word of the narration at which it should appear, copied exactly")
+
+
+class ChartRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(description="What this bar is, at most 24 characters")
+    value: float
+
+
+class ChartPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scene: int = Field(description="Scene number, counting from 0")
+    title: str = Field(description="Chart title, at most 50 characters")
+    unit: str = Field(description="Unit of the values, e.g. 'km' or '°C', or empty")
+    items: List[ChartRow] = Field(description="2 to 6 bars, values taken from the narration")
+
+
+class ExtrasPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    callouts: List[CalloutPlan]
+    charts: List[ChartPlan]
+
+
+def clean_callout(c) -> dict | None:
+    if not isinstance(c, dict):
+        return None
+    text = " ".join(str(c.get("text") or "").split())[:32]
+    return {"text": text, "anchor": " ".join(str(c.get("anchor") or "").split())[:40]} if text else None
+
+
+def clean_chart(c) -> dict | None:
+    if not isinstance(c, dict):
+        return None
+    items = []
+    for it in c.get("items") or []:
+        try:
+            value = float(it.get("value"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        label = " ".join(str(it.get("label") or "").split())[:24]
+        if label and math.isfinite(value) and value >= 0:
+            items.append({"label": label, "value": value})
+    if len(items) < 2:
+        return None
+    return {"title": " ".join(str(c.get("title") or "").split())[:60], "unit": str(c.get("unit") or "").strip()[:12],
+            "items": items[:8]}
+
+
+def suggest_extras(script: dict) -> dict:
+    """Claude picks each scene's on-screen fact (where it has one) and proposes charts where amounts are compared.
+    Fills only scenes that do not have them yet; returns {"callouts": n, "charts": n}."""
+    numbered = "\n".join(f"{i}. {s['narration']}" for i, s in enumerate(script["scenes"]))
+    prompt = f"""Narration of a YouTube video, numbered from 0:
+{numbered}
+
+1. Callouts: for the scenes whose narration has a striking number, date, name or fact worth seeing on screen, give that fact as short on-screen text (at most 28 characters, e.g. "4 cm a year", "1969", "−173 °C") and the word of the narration at which it should appear. At most one per scene, and only where it helps: usually fewer than half the scenes.
+2. Charts: only for scenes that compare two to six quantities stated in the narration, propose a simple bar chart with those exact values. Never invent numbers. Most videos have none or one."""
+    plan = claude_json(ANTHROPIC_MODEL, "You design clear, accurate on-screen graphics for documentaries.", prompt,
+                       ExtrasPlan, max_tokens=4000)
+    n = len(script["scenes"])
+    added = {"callouts": 0, "charts": 0}
+    for c in plan.callouts:
+        if 0 <= c.scene < n and not script["scenes"][c.scene].get("callout"):
+            callout = clean_callout(c.model_dump())
+            if callout:
+                script["scenes"][c.scene]["callout"] = callout
+                added["callouts"] += 1
+    for c in plan.charts:
+        if 0 <= c.scene < n and not script["scenes"][c.scene].get("chart"):
+            chart = clean_chart(c.model_dump())
+            if chart:
+                script["scenes"][c.scene]["chart"] = chart
+                added["charts"] += 1
+    return added
+
+
+def callout_timing(project: Path, i: int, scene: dict, tl: dict) -> tuple[float, float] | None:
+    """When scene i's callout shows, in seconds from the scene's start: from its anchor word for about 3 s."""
+    callout = scene.get("callout") or {}
+    if not callout.get("text"):
+        return None
+    words = scene_words(project, i, scene, tl)
+    norm = lambda w: re.sub(r"[^\w]", "", w.lower())
+    anchor = norm(callout.get("anchor") or "")
+    start = next((s for w, s, e in words if anchor and anchor in norm(w)), None)
+    if start is None:
+        start = 0.25 * tl.get("speech", tl["duration"])
+    end = min(start + 3.2, tl["duration"] - 0.15)
+    if end - start < 1.0:
+        start = max(0.0, end - 1.0)
+    return round(start, 2), round(end, 2)
+
+
+def scene_callouts(project: Path, script: dict, timeline: list[dict]) -> list[dict | None]:
+    """Per scene: {"text", "start", "end"} for its callout, or None (all None when CALLOUTS is off)."""
+    out = []
+    for i, (scene, tl) in enumerate(zip(script["scenes"], timeline)):
+        timing = callout_timing(project, i, scene, tl) if CALLOUTS else None
+        out.append({"text": scene["callout"]["text"], "start": timing[0], "end": timing[1]} if timing else None)
+    return out
+
+
+def write_callout_ass(callout: dict, out: Path, size: tuple[int, int]) -> Path:
+    """A one-line subtitle file that pops the callout up with a short fade and scale-in."""
+    w, h = size
+    vertical = h > w
+    # BorderStyle 3 draws a box in the outline colour behind the text: near-black, slightly see-through
+    style = ("Style: Callout,DejaVu Sans,{fs},&H00FFFFFF,&H00FFFFFF,&H40141414,&H64000000,-1,0,0,0,100,100,0,0,3,"
+             "18,0,{align},{ml},{mr},{mv},1").format(fs=84 if vertical else 76, align=8 if vertical else 7,
+                                                     ml=80 if vertical else 110, mr=80 if vertical else 110,
+                                                     mv=760 if vertical else 96)
+    lines = ["[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
+             "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, "
+             "Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+             "MarginL, MarginR, MarginV, Encoding", style, "", "[Events]",
+             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+             f"Dialogue: 0,{ass_time(callout['start'])},{ass_time(callout['end'])},Callout,,0,0,0,,"
+             f"{{\\fad(250,300)\\fscx85\\fscy85\\t(0,250,\\fscx100\\fscy100)}}{ass_text(callout['text'])}"]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
+
+
+def compact_number(v: float) -> str:
+    """1,284 / 12.9K / 4.2M: in full below ten thousand, compact above."""
+    for start, unit, suffix in ((1e12, 1e12, "T"), (1e9, 1e9, "B"), (1e6, 1e6, "M"), (1e4, 1e3, "K")):
+        if abs(v) >= start:
+            return f"{v / unit:.1f}".rstrip("0").rstrip(".") + suffix
+    return f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
+
+
+def render_chart(chart: dict, out: Path, size: tuple[int, int] = (1920, 1080)) -> Path:
+    """A single-series horizontal bar chart as a picture: dark surface, one blue, values at the bar tips."""
+    from PIL import Image, ImageDraw
+    w, h = size
+    surface, ink, ink2, baseline, bar = "#1a1a19", "#f0efec", "#c3c2b7", "#383835", "#3987e5"
+    img = Image.new("RGB", size, surface)
+    d = ImageDraw.Draw(img)
+    s = w / 1920
+    title_font, label_font, value_font = load_font(int(64 * s)), load_font(int(40 * s)), load_font(int(40 * s))
+    left, top = int(120 * s), int(100 * s)
+    d.text((left, top), chart.get("title") or "", font=title_font, fill=ink)
+    unit = chart.get("unit") or ""
+    if unit:
+        d.text((left, top + int(84 * s)), f"in {unit}", font=label_font, fill=ink2)
+    items = chart["items"]
+    peak = max(it["value"] for it in items) or 1
+    label_w = max(d.textlength(it["label"], font=label_font) for it in items)
+    x0 = left + int(label_w) + int(40 * s)            # the baseline the bars grow from
+    value_room = int(260 * s)
+    area_top, area_bottom = top + int(200 * s), h - int(110 * s)
+    slot = (area_bottom - area_top) / len(items)
+    thick = int(min(72 * s, slot * 0.55))
+    radius = max(4, int(12 * s))
+    d.line([(x0, area_top - int(10 * s)), (x0, area_bottom)], fill=baseline, width=max(1, int(2 * s)))
+    for k, it in enumerate(items):
+        cy = area_top + slot * k + slot / 2
+        length = max(radius * 2, (w - left - value_room - x0) * it["value"] / peak)
+        y1, y2 = int(cy - thick / 2), int(cy + thick / 2)
+        d.rounded_rectangle([x0, y1, x0 + length, y2], radius=radius, fill=bar)
+        d.rectangle([x0, y1, x0 + radius, y2], fill=bar)   # square at the baseline, rounded at the data end
+        d.text((x0 - int(24 * s), cy), it["label"], font=label_font, fill=ink2, anchor="rm")
+        value = compact_number(it["value"]) + (f" {unit}" if unit and len(unit) <= 4 else "")
+        d.text((x0 + length + int(20 * s), cy), value, font=value_font, fill=ink, anchor="lm")
+    img.save(out)
+    return out
+
+
+def use_chart(project: Path, i: int, chart: dict) -> dict:
+    """Make scene i's chart its visual (the picture gets the usual slow zoom)."""
+    chart = clean_chart(chart)
+    if not chart:
+        raise ValueError("A chart needs at least two bars with numbers")
+    folder = project / "charts"
+    folder.mkdir(exist_ok=True)
+    png = render_chart(chart, folder / f"chart_{i:02d}_{uuid.uuid4().hex[:6]}.png")
+    manifest = load_manifest(project)
+    asset = {"kind": "image", "url": "", "id": f"chart:{png.stem}", "credit": "", "query": chart["title"],
+             "source": "chart"}
+    store_asset(project, manifest, i, asset, copy_from=png)
+    log(f"Scene {i + 1} now shows the chart “{chart['title']}”")
+    return asset
+
+
 def load_font(size: int):
     from PIL import ImageFont
     candidates = [THUMB_FONT,
@@ -2646,8 +2854,9 @@ def make_short(project: Path, script: dict, timeline: list[dict], assets: list[d
     log(f"Making the Short: scenes {s['first'] + 1} to {s['last'] + 1} ({s['seconds']:.0f} s)")
     sub_tl = [timeline[i] for i in scenes]
     seg_dir = d / "segments"
+    all_callouts = scene_callouts(project, script, timeline)
     xf = render_segments(project, sub_tl, [assets[i] for i in scenes], seg_dir=seg_dir,
-                         size=(SHORT_W, SHORT_H), zoom=scenes)
+                         size=(SHORT_W, SHORT_H), zoom=scenes, callouts=[all_callouts[i] for i in scenes])
     video_only = d / "video_only.mp4"
     if join_needed(seg_dir, sub_tl, video_only):
         join_segments(seg_dir, sub_tl, xf, video_only)
@@ -3114,7 +3323,7 @@ def process(project: Path, topic: str | None, args) -> None:
 
     timeline = make_voiceover(project, script)
     assets = gather_visuals(project, script, timeline)
-    assemble(project, timeline, assets)
+    assemble(project, timeline, assets, script)
     write_srt(project, script, timeline)
     ensure_chapters(project, script, timeline)
     make_thumbnail(project, script, timeline, assets)

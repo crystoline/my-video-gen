@@ -104,6 +104,7 @@ Then open http://localhost:8765. From WSL, open it in your normal Windows browse
 
 - **Videos:** start a video from a topic (**Claude writes the script**), or paste your own narration (**I have the script**) with the same scene and `Visual:` rules as `--script-file`; you choose whether Claude picks visuals and whether it is fact-checked. See where every video stands. Once videos are uploaded, a table shows each one's views, watch time, average view duration and likes (plus its Short's views), so you can see which topics work. Click **Refresh statistics** to update it.
 - **Script:** edit the title, description, tags and each scene's narration and visual search. Apply the fact-checker's fixes with one click, and move, add, delete, split (✂ at the text cursor) or join scenes. Narration clips and visuals follow their scene when you reorder, so nothing is narrated twice. Each scene shows whether its narration clip is current or will be regenerated, with its character count.
+- **On-screen text and charts:** each scene can show a short callout (its key fact, such as "4 cm a year") that pops up at a chosen word, burned into that scene only. **Suggest on-screen text and charts** on the Script tab lets Claude pick them and propose bar charts where the narration compares amounts; you can edit both, and **Use chart as visual** turns a chart into the scene's picture. `CALLOUTS` (Settings) switches the callouts off.
 - **Visuals:** see every scene's image or clip. **Choose…** opens a grid of search results from Pexels, Pixabay or NASA with preview images (video clips play when you hover), so you can compare a dozen options, change the search words, and pick one. Only the one you pick is downloaded. **Next result** swaps in the next search result without looking, and you can upload your own image or video. Claude can act as picture editor: it looks at the previews and marks the result that best fits the narration (**Ask Claude to pick**, or automatically on every search with `AUTO_PICK=rank`). With `AUTO_PICK=auto`, automatic fetches and **Next result** use Claude's pick too. Pick the thumbnail background here too.
 - **Video:** render, watch, choose this video's music track, preview the sound, edit the chapters, update the thumbnail, and upload to YouTube with privacy and schedule options. Chapters are suggested by Claude when the video renders (`AUTO_CHAPTERS`) and added to the description as timestamps, as long as they meet YouTube's rules (at least 3, the first at 0:00, each at least 10 seconds).
 - **Other languages (Video tab):** with caption languages chosen in Settings (`CAPTION_LANGUAGES`), uploads get translated captions, titles and descriptions, so viewers can watch with subtitles and find the video in their language; already-uploaded videos can get them with one click. **Make this version** creates a dubbed copy in another language: same visuals and music, a translated script to review, then its own voiceover (ElevenLabs characters, as for any video) and upload in that language.
@@ -156,8 +157,9 @@ The tests replace Claude, ElevenLabs, the stock searches and YouTube with fakes 
 
 ## Ideas for later
 
-- Add NASA/ESA video clips, or charts made with matplotlib for data-heavy topics.
+- Add NASA/ESA video clips, and maps for history and geography topics.
 - Have Claude write the pinned comment and community posts.
+- Storyblocks (paid stock library) once there is an API contract; Coverr is left out because its terms exclude commercial use.
 
 
 ```bash

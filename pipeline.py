@@ -86,7 +86,7 @@ def configure() -> None:
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
     global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
     global FAL_KEY, AI_VISUALS, AI_IMAGE_MODEL, AI_VIDEO_MODEL, AI_IMAGE_COST, AI_VIDEO_COST
-    global RENDER_JOBS, SHOT_SECONDS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    global RENDER_JOBS, SHOT_SECONDS, AUTO_CHAPTERS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
     FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
@@ -124,6 +124,7 @@ def configure() -> None:
     CROSSFADE = float(os.getenv("CROSSFADE", "0.5"))
     RENDER_JOBS = int(os.getenv("RENDER_JOBS") or 0)   # scenes rendered at once; 0 = automatic
     SHOT_SECONDS = float(os.getenv("SHOT_SECONDS") or 0)   # a long scene gets a new shot about this often; 0 = off
+    AUTO_CHAPTERS = _flag("AUTO_CHAPTERS", True)   # Claude suggests chapters at render time if there are none
     YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
     YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
     THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
@@ -2191,6 +2192,89 @@ def write_srt(project: Path, script: dict, timeline: list[dict]) -> Path:
     return path
 
 
+# ----------------------------------------------------------------------------
+# Chapters: timestamps in the description that split the video into titled parts
+# ----------------------------------------------------------------------------
+class Chapter(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scene: int = Field(description="Number of the scene the chapter starts at, counting from 0")
+    title: str = Field(description="2-6 words, specific to what this part covers")
+
+
+class ChapterPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chapters: List[Chapter]
+
+
+def scene_starts(timeline: list[dict]) -> list[float]:
+    """When each scene starts in the finished video, in seconds."""
+    return list(itertools.accumulate([0.0] + [t["duration"] for t in timeline[:-1]]))
+
+
+def clock(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def clean_chapters(chapters: list, n: int) -> list[dict]:
+    """Chapters in order, one per starting scene, the first at scene 0."""
+    out: dict[int, str] = {}
+    for c in chapters or []:
+        scene, title = (c.get("scene"), c.get("title")) if isinstance(c, dict) else (None, None)
+        title = " ".join(str(title or "").split())[:60]
+        if isinstance(scene, int) and 0 <= scene < n and title and scene not in out:
+            out[scene] = title
+    items = [{"scene": s, "title": t} for s, t in sorted(out.items())]
+    if items:
+        items[0]["scene"] = 0
+    return items
+
+
+def chapter_lines(script: dict, timeline: list[dict]) -> list[str]:
+    """YouTube chapter lines ("1:23 Title"), or [] when they would break YouTube's rules
+    (at least 3 chapters, the first at 0:00, each at least 10 seconds long)."""
+    n = min(len(script["scenes"]), len(timeline))
+    starts = scene_starts(timeline[:n])
+    total = sum(t["duration"] for t in timeline[:n])
+    kept: list[dict] = []
+    for c in clean_chapters(script.get("chapters"), n):
+        if kept and starts[c["scene"]] - starts[kept[-1]["scene"]] < 10:
+            continue   # too soon after the previous chapter
+        kept.append(c)
+    if kept and total - starts[kept[-1]["scene"]] < 10:
+        kept.pop()
+    if len(kept) < 3:
+        return []
+    return [f"{clock(starts[c['scene']])} {c['title']}" for c in kept]
+
+
+def suggest_chapters(script: dict, timeline: list[dict]) -> list[dict]:
+    starts = scene_starts(timeline)
+    numbered = "\n".join(f"{i}. [{clock(starts[i])}] {s['narration']}" for i, s in enumerate(script["scenes"]))
+    total = sum(t["duration"] for t in timeline)
+    prompt = f"""Video title: {script.get('title', '')}
+
+Narration by scene, numbered from 0, with each scene's start time:
+{numbered}
+
+The video lasts {clock(total)}. Split it into YouTube chapters: {'3 to 5' if total < 300 else '4 to 8'} chapters, the first starting at scene 0, each at least 40 seconds long, each starting where the narration moves to a new part of the story. Titles: 2-6 words, specific to that part, no clickbait, no numbering, no emoji."""
+    plan = claude_json(ANTHROPIC_MODEL, "You write clear, accurate YouTube chapter titles.", prompt, ChapterPlan,
+                       max_tokens=2000)
+    return clean_chapters([c.model_dump() for c in plan.chapters], len(script["scenes"]))
+
+
+def ensure_chapters(project: Path, script: dict, timeline: list[dict]) -> None:
+    """With AUTO_CHAPTERS on, suggest chapters for a rendered video that has none (failures only log a note)."""
+    if not AUTO_CHAPTERS or script.get("chapters") or not os.getenv("ANTHROPIC_API_KEY"):
+        return
+    try:
+        script["chapters"] = suggest_chapters(script, timeline)
+        save_json(project / "script.json", script)
+        log(f"Chapters suggested: {', '.join(c['title'] for c in script['chapters'])}")
+    except Exception as e:
+        log(f"Note: chapters could not be suggested ({type(e).__name__}: {str(e)[:150]})")
+
+
 def load_font(size: int):
     from PIL import ImageFont
     candidates = [THUMB_FONT,
@@ -2378,10 +2462,13 @@ def clean_text(s: str) -> str:
     return s.replace("<", "").replace(">", "")  # YouTube rejects angle brackets
 
 
-def build_description(script: dict, assets: list[dict]) -> str:
+def build_description(script: dict, assets: list[dict], timeline: list[dict] | None = None) -> str:
     credits = list(dict.fromkeys(v["credit"] for a in assets if a for v in [a, *(a.get("shots") or [])]
                                  if v and v.get("credit")))
     desc = clean_text(script.get("description", "")).strip()
+    chapters = chapter_lines(script, timeline) if timeline else []
+    if chapters:
+        desc += "\n\nChapters:\n" + "\n".join(clean_text(line) for line in chapters)
     if credits:
         desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
     desc += "\n\nNarration uses an AI-generated voice. Script researched and reviewed by the channel."
@@ -2425,7 +2512,8 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
     body = {
         "snippet": {
             "title": clean_text(script["title"])[:100],
-            "description": build_description(script, assets),
+            "description": build_description(script, assets, load_json(project / "timeline.json")
+                                             if (project / "timeline.json").exists() else None),
             "tags": trim_tags(script.get("tags", [])),
             "categoryId": "28",  # Science & Technology
             "defaultLanguage": "en",
@@ -2681,6 +2769,7 @@ def process(project: Path, topic: str | None, args) -> None:
     assets = gather_visuals(project, script, timeline)
     assemble(project, timeline, assets)
     write_srt(project, script, timeline)
+    ensure_chapters(project, script, timeline)
     make_thumbnail(project, script, timeline, assets)
 
     if args.no_upload:

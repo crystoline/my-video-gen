@@ -277,6 +277,7 @@ def project_state(slug: str, detail: bool = False) -> dict:
     track = pl.project_music(p, save=False)
     state.update({
         "short": short_state(slug, p, script, timeline_for(p, script) if script else [], meta, newest_input),
+        "chapter_lines": pl.chapter_lines(script, scene_tl) if script else [],
         "music": {"choice": meta.get("music"), "auto": bool(meta.get("music_auto")),
                   "track": track.name if track else None, "default": pl.describe_default_music()},
         "script": script, "factcheck": pl.load_json(check_path) if check_path.exists() else None,
@@ -359,6 +360,9 @@ def clean_script(new: dict, old: dict) -> dict:
            "topic": old.get("topic", "")}
     if thumb_scene is not None:
         out["thumbnail_scene"] = thumb_scene
+    chapters = pl.clean_chapters(new.get("chapters") if isinstance(new.get("chapters"), list) else [], len(out_scenes))
+    if chapters:
+        out["chapters"] = chapters
     return out
 
 
@@ -569,8 +573,17 @@ def job_render(slug: str) -> None:
     assets = pl.gather_visuals(p, script, timeline)
     pl.assemble(p, timeline, assets)
     pl.write_srt(p, script, timeline)
+    pl.ensure_chapters(p, script, timeline)
     pl.make_thumbnail(p, script, timeline, assets)
     pl.log("Captions and thumbnail updated")
+
+
+def job_chapters(slug: str) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    script["chapters"] = pl.suggest_chapters(script, timeline_for(p, script))
+    pl.save_json(p / "script.json", script)
+    pl.log(f"Chapters: {', '.join(c['title'] for c in script['chapters'])}")
 
 
 def job_short(slug: str) -> None:
@@ -796,6 +809,7 @@ ACTIONS = {
     "render": ("Render the video", job_render),
     "thumbnail": ("Update the thumbnail", job_thumbnail),
     "short": ("Make the Short", job_short),
+    "chapters": ("Suggest chapters", job_chapters),
 }
 
 
@@ -1111,6 +1125,7 @@ SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float", "SHOT_SECONDS": "float",
+    "AUTO_CHAPTERS": "bool",
     "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
     "AI_VISUALS": "choice", "AI_IMAGE_MODEL": "text", "AI_VIDEO_MODEL": "text", "AI_IMAGE_COST": "float",
     "AI_VIDEO_COST": "float",
@@ -1139,7 +1154,8 @@ def current_settings() -> dict:
             "VOICE_TONE": pl.VOICE_TONE, "VOICE_STABILITY": pl.VOICE_STABILITY,
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
-            "CROSSFADE": pl.CROSSFADE, "SHOT_SECONDS": pl.SHOT_SECONDS, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
+            "CROSSFADE": pl.CROSSFADE, "SHOT_SECONDS": pl.SHOT_SECONDS, "AUTO_CHAPTERS": pl.AUTO_CHAPTERS,
+            "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
             "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK, "AI_VISUALS": pl.AI_VISUALS,
             "AI_IMAGE_MODEL": pl.AI_IMAGE_MODEL, "AI_VIDEO_MODEL": pl.AI_VIDEO_MODEL,
             "AI_IMAGE_COST": pl.AI_IMAGE_COST, "AI_VIDEO_COST": pl.AI_VIDEO_COST}

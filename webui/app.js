@@ -309,6 +309,8 @@ function makeDraft() {
   if (S.draft) {
     S.draft.scenes.forEach((s, i) => { s._orig = i; });
     S.draft._thumbScene = Number.isInteger(S.draft.thumbnail_scene) ? S.draft.scenes[S.draft.thumbnail_scene] : null;
+    // Chapters point at scene objects, so they follow their scenes when scenes are moved
+    S.draft._chapters = (S.draft.chapters || []).map(c => ({ s: S.draft.scenes[c.scene], title: c.title })).filter(c => c.s);
   }
   S.dirty = false;
   hideSaveBar();
@@ -338,6 +340,8 @@ async function saveDraft() {
   };
   const ti = d._thumbScene ? d.scenes.indexOf(d._thumbScene) : -1;
   if (ti >= 0) script.thumbnail_scene = ti;
+  script.chapters = (d._chapters || []).map(c => ({ scene: d.scenes.indexOf(c.s), title: c.title }))
+    .filter(c => c.scene >= 0 && c.title.trim()).sort((a, b) => a.scene - b.scene);
   const origin = d.scenes.map(s => (s._orig == null ? null : s._orig));
   try {
     S.project = await api("PUT", `/api/projects/${encodeURIComponent(S.slug)}/script`, { script, origin });
@@ -863,8 +867,47 @@ function videoTab(p) {
       h("div", { class: "row", style: "margin-top:.5rem" },
         h("a", { class: "btn small", href: p.final_url, download: `${p.slug}.mp4` }, "Download MP4"),
         p.captions_url ? h("a", { class: "btn small", href: p.captions_url, download: `${p.slug}.srt` }, "Download captions") : null)) : null,
+    chaptersPanel(p),
     thumbnailPanel(p),
     uploadPanel(p, st, "video"));
+}
+
+function clock(sec) {
+  const s = Math.floor(sec);
+  return s >= 3600 ? `${Math.floor(s / 3600)}:${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+    : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function chaptersPanel(p) {
+  const d = S.draft;
+  if (!d) return null;
+  const secs = (p.short && p.short.scene_seconds) || [];
+  const starts = secs.map((_, i) => secs.slice(0, i).reduce((a, b) => a + b, 0));
+  const list = d._chapters || (d._chapters = []);
+  const sorted = () => list.sort((a, b) => d.scenes.indexOf(a.s) - d.scenes.indexOf(b.s));
+  sorted();
+  const sceneLabel = k => `${clock(starts[k] || 0)} · scene ${k + 1}: ${d.scenes[k].narration.slice(0, 50)}…`;
+  const rows = list.map((c, k) => h("div", { class: "queue-item" },
+    h("select", { onchange: e => { c.s = d.scenes[Number(e.target.value)]; markDirty(); renderProject(); } },
+      d.scenes.map((s, j) => h("option", { value: j, selected: s === c.s ? true : null }, sceneLabel(j)))),
+    h("input", { class: "grow", value: c.title, maxlength: 60, placeholder: "Chapter title", oninput: e => { c.title = e.target.value; markDirty(); } }),
+    h("button", { class: "small danger", title: "Remove chapter", onclick: () => { list.splice(k, 1); markDirty(); renderProject(); } }, "✕")));
+  const lines = p.chapter_lines || [];
+  return h("div", { class: "panel stack" },
+    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, "Chapters"),
+      h("div", { class: "row" },
+        h("button", { class: "small", onclick: () => startJob("chapters", null,
+          list.length ? "Replace these chapters with Claude's suggestions (about a cent)?" : null) }, list.length ? "Suggest again" : "Suggest chapters"),
+        h("button", { class: "small", onclick: () => {
+          const used = new Set(list.map(c => c.s));
+          const free = d.scenes.find(s => !used.has(s));
+          if (!free) { toast("Every scene already starts a chapter"); return; }
+          list.push({ s: free, title: "" }); markDirty(); renderProject();
+        } }, "Add chapter"))),
+    list.length ? h("div", {}, rows) : h("p", { class: "muted small" }, "No chapters yet. Claude suggests them when the video renders (Settings), or click “Suggest chapters”."),
+    h("p", { class: "muted small" }, lines.length
+      ? `On upload, the description gets: ${lines.join(" · ")}`
+      : "YouTube needs at least 3 chapters, the first at 0:00, each at least 10 seconds long; until then none are added to the description."));
 }
 
 function trackName(path) { return String(path).split("/").pop(); }
@@ -1118,6 +1161,8 @@ function renderSettings(voiced) {
       h("p", { class: "muted small" }, "These only affect narration generated after you save. To hear them on an existing scene, use Re-voice on the Script tab (it costs that scene's characters).")),
     h("div", { class: "panel stack" }, h("h2", {}, "Video"),
       h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1)),
+      h("label", { class: "row" }, h("input", { type: "checkbox", checked: v.AUTO_CHAPTERS, onchange: e => { vals.AUTO_CHAPTERS = e.target.checked; } }),
+        h("span", { style: "margin:0" }, "Chapters: when a video renders without chapters, Claude suggests them (about a cent)")),
       h("label", {}, h("span", {}, "Extra shots for long scenes (keeps the picture moving; extra visuals are fetched automatically)"),
         h("select", { onchange: e => { vals.SHOT_SECONDS = Number(e.target.value); } },
           [[0, "Off: one visual per scene"], [8, "A new shot about every 8 s"], [10, "About every 10 s"], [12, "About every 12 s"], [15, "About every 15 s"]]

@@ -33,6 +33,8 @@ class Fakes:
         self.uploads: list = []
         self.factcheck_delay = 0.0
         self.scene_count = 4
+        self.plans: list = []
+        self.factchecks = 0
 
     def write_script(self, topic, minutes, previous):
         return {"title": f"Title for {topic}", "description": "Desc", "tags": ["a", "b"],
@@ -40,7 +42,13 @@ class Fakes:
                 "scenes": [{"narration": f"This is narration number {k} for the test video.",
                             "visual": {"source": "nasa", "query": f"query {k}"}} for k in range(self.scene_count)]}
 
+    def plan_visuals(self, title, narrations):
+        self.plans.append(list(narrations))
+        return {"description": f"About {title}", "tags": ["one", "two"], "thumbnail_text": "WOW",
+                "visuals": [{"source": "stock_photo", "query": f"planned {k}"} for k in range(len(narrations))]}
+
     def fact_check(self, script, project_dir):
+        self.factchecks += 1
         time.sleep(self.factcheck_delay)
         (project_dir / "factcheck_notes.md").write_text("Full notes", encoding="utf-8")
         return {"issues": [{"scene": 2, "problem": "Wrong number", "fixed_narration": "Corrected scene two.",

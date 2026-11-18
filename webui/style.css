@@ -130,6 +130,10 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 .vcard .narr { font-size: .85rem; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 .warn-text { color: var(--warn); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; padding: .3rem .8rem; font-size: .88rem; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.active { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
 audio.mini { height: 32px; max-width: 280px; }
 .modal-back {
   position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, .55);

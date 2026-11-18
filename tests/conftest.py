@@ -79,6 +79,7 @@ def fakes(monkeypatch):
     f = Fakes()
     monkeypatch.setattr(pl, "write_script", f.write_script)
     monkeypatch.setattr(pl, "fact_check", f.fact_check)
+    monkeypatch.setattr(pl, "plan_visuals", f.plan_visuals)
     monkeypatch.setattr(pl, "find_visual", f.find_visual)
     monkeypatch.setattr(pl, "download", f.download)
     monkeypatch.setattr(pl, "tts", f.tts)

@@ -383,6 +383,158 @@ Also give a YouTube title (max 90 characters, curiosity-driven but accurate), a 
     return script
 
 
+# ----------------------------------------------------------------------------
+# Scripts you write yourself: your narration is kept word for word
+# ----------------------------------------------------------------------------
+class VisualPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str = Field(description="2-3 short paragraphs for the YouTube description")
+    tags: List[str] = Field(description="10 to 15 short tags")
+    thumbnail_text: str = Field(description="2-5 punchy words for the thumbnail")
+    visuals: List[Visual] = Field(description="Exactly one visual per scene, in scene order")
+
+
+PLANNER_SYSTEM = """You are the editor of a faceless YouTube channel. The narration you are given is final: never change, correct or comment on it. Your job is to choose a fitting visual for every scene and to write the YouTube description, tags and thumbnail text."""
+
+_SCENE_LABEL = re.compile(r"^\s*[\[(]?\s*scene\s*\d+\s*[\])]?\s*[:.)\-–—]?\s*", re.I)
+_VISUAL_LINE = re.compile(r"^\s*[\[(]?\s*visual\s*[:\-–—]\s*(.*?)\s*[\])]?\s*$", re.I)
+_HINT_SOURCE = re.compile(r"^\s*(nasa|stock[ _]video|stock[ _]photo|video|photo)\s*:\s*(.+)$", re.I)
+_HINT_SOURCES = {"nasa": "nasa", "stock video": "stock_video", "video": "stock_video",
+                 "stock photo": "stock_photo", "photo": "stock_photo"}
+_STOPWORDS = set("""a an the and or but if of to in on at by for with from as is are was were be been being it its
+this that these those there their they them we our you your he she his her i me my not no so than then too very can
+could would should will just about into over under more most such what which who whom how why when where while also
+only even because each every some many much like after before during through between until upon""".split())
+
+
+def _visual_hint(hint: str | None) -> dict:
+    """'ocean waves', 'nasa: Jupiter' or 'photo: old library' -> a scene's visual."""
+    hint = (hint or "").strip()
+    m = _HINT_SOURCE.match(hint)
+    if m:
+        return {"source": _HINT_SOURCES[m.group(1).lower().replace("_", " ")], "query": m.group(2).strip()[:100]}
+    return {"source": "stock_video", "query": hint[:100]}
+
+
+def split_sentences(text: str) -> list[str]:
+    out, start = [], 0
+    for m in re.finditer(r'[.!?…]+["”’)\]]*\s+(?=["“‘(\[]?[A-Z0-9])', text):
+        out.append(text[start:m.end()].strip())
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    return out
+
+
+def group_sentences(sentences: list[str], target: int = 28, limit: int = 50) -> list[str]:
+    """Scenes of about two sentences: close a scene once it reaches `target` words, never pass `limit`."""
+    scenes, current, n = [], [], 0
+    for s in sentences:
+        w = len(s.split())
+        if current and n + w > limit:
+            scenes.append(" ".join(current))
+            current, n = [], 0
+        current.append(s)
+        n += w
+        if n >= target:
+            scenes.append(" ".join(current))
+            current, n = [], 0
+    if current:
+        if scenes and n < 8:   # no tiny last scene
+            scenes[-1] += " " + " ".join(current)
+        else:
+            scenes.append(" ".join(current))
+    return scenes
+
+
+def parse_manual_script(text: str) -> list[dict]:
+    """Scenes from narration you wrote yourself:
+    - a blank line, or a line starting with "Scene 3:", starts a new scene;
+    - a line "Visual: ocean waves" (or "Visual: nasa: Jupiter", "Visual: photo: old map") sets the scene's visual search;
+    - text without any scene breaks is split into scenes of about two sentences."""
+    scenes: list[dict] = []
+    lines: list[str] = []
+    visual: str | None = None
+
+    def flush():
+        nonlocal lines, visual
+        narration = " ".join(" ".join(lines).split())
+        if narration:
+            scenes.append({"narration": narration, "visual": _visual_hint(visual)})
+        elif visual and scenes and not scenes[-1]["visual"]["query"]:   # a "Visual:" line on its own after a scene
+            scenes[-1]["visual"] = _visual_hint(visual)
+        lines, visual = [], None
+
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not raw.strip():
+            flush()
+            continue
+        m = _VISUAL_LINE.match(raw)
+        if m:
+            visual = m.group(1)
+            continue
+        if _SCENE_LABEL.match(raw):
+            flush()
+            raw = _SCENE_LABEL.sub("", raw, count=1)
+        if raw.strip():
+            lines.append(raw.strip())
+    flush()
+    if len(scenes) == 1 and len(scenes[0]["narration"].split()) > 50:
+        only = scenes[0]
+        parts = group_sentences(split_sentences(only["narration"]))
+        scenes = [{"narration": t, "visual": dict(only["visual"]) if k == 0 else _visual_hint(None)}
+                  for k, t in enumerate(parts)]
+    return scenes
+
+
+def keyword_query(text: str, fallback: str) -> str:
+    """A rough visual search from a scene's own words (used when Claude does not choose visuals)."""
+    words = [w.strip(".,;:!?\"'()[]{}—–-…“”‘’").lower() for w in text.split()]
+    candidates = [w for w in words if len(w) > 3 and w.isalpha() and w not in _STOPWORDS]
+    best = set(sorted(dict.fromkeys(candidates), key=lambda w: -len(w))[:3])
+    return " ".join(w for w in dict.fromkeys(candidates) if w in best) or fallback[:100]
+
+
+def plan_visuals(title: str, narrations: list[str]) -> dict:
+    """Claude chooses a visual for each scene and writes the description, tags and thumbnail text."""
+    numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(narrations))
+    prompt = f"""Video title: {title}
+
+Narration, numbered from 0, one scene per line:
+{numbered}
+
+For every scene, in order, choose ONE visual source:
+- "nasa": NASA image library. Only for space: planets, moons, the Sun, stars, galaxies, spacecraft, rockets, astronauts, Earth from orbit.
+- "stock_video": stock footage. The best choice for almost everything else: people, places, cities, nature, animals, history, technology, everyday life.
+- "stock_photo": stock photo, when a still image fits better (objects, documents, portraits, old places).
+The query must be 2-5 concrete, searchable words describing what is visible on screen (e.g. "busy city street night", "old printing press", "lava flow ocean"). Never abstract ideas, never names of people who are not famous.
+
+Return exactly {len(narrations)} visuals. Also write a YouTube description of 2-3 short paragraphs, 10 to 15 short tags and 2-5 punchy words of thumbnail text."""
+    return claude_json(ANTHROPIC_MODEL, PLANNER_SYSTEM, prompt, VisualPlan).model_dump()
+
+
+def script_from_text(title: str, text: str, suggest: bool = True) -> dict:
+    """A script from your own narration. With suggest=True, Claude fills in the visuals you did not choose,
+    the description, tags and thumbnail text; the narration is never changed."""
+    scenes = parse_manual_script(text)
+    if not scenes:
+        raise ValueError("The script has no narration")
+    script = {"title": title.strip(), "description": "", "tags": [], "thumbnail_text": "", "topic": title.strip(),
+              "scenes": scenes}
+    if suggest:
+        log("Claude is choosing visuals and writing the description and tags (your narration stays as written)")
+        plan = plan_visuals(script["title"], [s["narration"] for s in scenes])
+        for scene, visual in zip(scenes, plan.get("visuals") or []):
+            if not scene["visual"]["query"] and visual.get("query"):
+                scene["visual"] = {"source": visual["source"], "query": visual["query"][:100]}
+        script.update(description=plan.get("description", ""), tags=plan.get("tags", []),
+                      thumbnail_text=plan.get("thumbnail_text", ""))
+    for scene in scenes:
+        if not scene["visual"]["query"]:
+            scene["visual"]["query"] = keyword_query(scene["narration"], script["title"])
+    return script
+
+
 def fact_check(script: dict, project: Path) -> dict:
     """Two passes: research with web search (free text), then convert the notes to structured data."""
     numbered = "\n".join(f"{i}. {s['narration']}" for i, s in enumerate(script["scenes"]))
@@ -1888,6 +2040,33 @@ def preflight(upload_enabled: bool, unattended: bool) -> None:
         sys.exit("Setup problems:\n- " + "\n- ".join(problems))
 
 
+def create_script(project: Path, topic: str | None, args) -> dict:
+    """Write the script (or take yours from --script-file), fact-check it and save it with review notes."""
+    script_file = getattr(args, "script_file", None)
+    if script_file:
+        if not topic:
+            sys.exit("--script-file needs a title: add --title \"Your video title\"")
+        log(f"Using your script from {script_file}")
+        script = script_from_text(topic, Path(script_file).read_text(encoding="utf-8"), suggest=True)
+        save_meta(project, dict(load_meta(project), topic=topic, source="manual", created=datetime.now().isoformat()))
+    else:
+        if not topic:
+            sys.exit("No script.json in this project and no topic given.")
+        log(f"Writing script: {topic}")
+        script = write_script(topic, args.minutes, previous_titles(project))
+    log("Fact-checking")
+    check = fact_check(script, project)
+    save_json(project / "factcheck.json", check)
+    if args.yes:
+        n = apply_fixes(script, check)
+        log(f"Applied {n} fact-check fix(es) automatically")
+    save_json(project / "script.json", script)
+    review = write_review(project, script, check)
+    words, chars = narration_stats(script)
+    log(f"Narration: {words} words, {chars} characters. Review notes: {review}")
+    return script
+
+
 def process(project: Path, topic: str | None, args) -> None:
     project.mkdir(parents=True, exist_ok=True)
     script_path = project / "script.json"
@@ -1897,20 +2076,7 @@ def process(project: Path, topic: str | None, args) -> None:
         script = load_json(script_path)
         log("Using existing script.json")
     else:
-        if not topic:
-            sys.exit("No script.json in this project and no topic given.")
-        log(f"Writing script: {topic}")
-        script = write_script(topic, args.minutes, previous_titles(project))
-        log("Fact-checking")
-        check = fact_check(script, project)
-        save_json(project / "factcheck.json", check)
-        if args.yes:
-            n = apply_fixes(script, check)
-            log(f"Applied {n} fact-check fix(es) automatically")
-        save_json(script_path, script)
-        review = write_review(project, script, check)
-        words, chars = narration_stats(script)
-        log(f"Narration: {words} words, {chars} characters. Review notes: {review}")
+        script = create_script(project, topic, args)
 
     approved = project / ".approved"
     if not approved.exists():
@@ -2002,6 +2168,9 @@ def main() -> None:
     p.add_argument("--project", type=Path, help="Resume an existing project folder")
     p.add_argument("--topics-file", type=Path, help="Take the next topic from this file (for scheduling)")
     p.add_argument("--minutes", type=float, default=6, help="Target video length (default 6)")
+    p.add_argument("--script-file", type=Path,
+                   help="Use your own narration from a text file (blank lines separate scenes) instead of writing one")
+    p.add_argument("--title", help="Video title, used with --script-file")
     p.add_argument("--yes", action="store_true", help="Unattended: auto-apply fact-check fixes, skip review pause")
     p.add_argument("--no-upload", action="store_true", help="Build the video but don't upload")
     p.add_argument("--privacy", choices=["private", "unlisted", "public"], default="private")
@@ -2019,6 +2188,11 @@ def main() -> None:
 
     if args.topics_file:
         run_from_topics_file(args)
+    elif args.script_file:
+        title = args.title or args.topic
+        if not title:
+            p.error('--script-file needs --title "Your video title"')
+        process(args.project or PROJECTS_DIR / slugify(title), title, args)
     elif args.project:
         process(args.project, args.topic, args)
     elif args.topic:

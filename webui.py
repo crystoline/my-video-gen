@@ -38,6 +38,7 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 SOURCES = ("nasa", "stock_video", "stock_photo")
+MANUAL_TEXT = "my_script.txt"   # narration pasted in "I have the script", as typed
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 ** 3   # custom video clips can be large
@@ -234,6 +235,7 @@ def project_state(slug: str, detail: bool = False) -> dict:
         "slug": slug,
         "title": (script or {}).get("title") or meta.get("topic") or slug,
         "topic": (script or {}).get("topic") or meta.get("topic", ""),
+        "source": meta.get("source", "claude"),
         "step": step, "scenes": n, "words": words, "chars": chars,
         "minutes": round(words / pl.WORDS_PER_MINUTE, 1),
         "voice_todo": todo, "voice_todo_chars": todo_chars,
@@ -441,6 +443,20 @@ def job_create(slug: str, topic: str, minutes: float) -> None:
     script = pl.write_script(topic, minutes, pl.previous_titles(p))
     pl.save_json(p / "script.json", script)
     run_factcheck(p, script)
+
+
+def job_create_manual(slug: str, title: str, suggest: bool, factcheck: bool) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = pl.script_from_text(title, (p / MANUAL_TEXT).read_text(encoding="utf-8"), suggest)
+    words, chars = pl.narration_stats(script)
+    pl.log(f"Your script: {len(script['scenes'])} scenes, {words} words, {chars} characters (about "
+           f"{words / pl.WORDS_PER_MINUTE:.1f} min)")
+    pl.save_json(p / "script.json", script)
+    if factcheck:
+        run_factcheck(p, script)
+    else:
+        pl.write_review(p, script, {})
+        pl.log("Fact-check skipped. You can run it any time with “Fact-check again” on the Script tab.")
 
 
 def job_factcheck(slug: str) -> None:
@@ -664,6 +680,8 @@ def api_projects():
 @app.post("/api/projects")
 def api_create_project():
     data = body()
+    if data.get("mode") == "manual":
+        return create_manual_project(data)
     topic = str(data.get("topic", "")).strip()
     if not topic:
         raise ValueError("Enter a topic")
@@ -681,6 +699,54 @@ def api_create_project():
         comments, topics = read_queue()
         write_queue(comments, [t for t in topics if t != topic])
     return jsonify({"slug": slug, "job": job.to_dict()})
+
+
+def create_manual_project(data: dict):
+    """A video from narration you wrote: kept word for word, then (optionally) visuals and fact-check."""
+    title = " ".join(str(data.get("title") or "").split())
+    text = str(data.get("script") or "")
+    if not title:
+        raise ValueError("Enter a title")
+    if len(title) > 100:
+        raise ValueError("The title is longer than 100 characters")
+    if len(text) > 60_000:
+        raise ValueError("The script is longer than 60,000 characters")
+    scenes = pl.parse_manual_script(text)
+    if not scenes:
+        raise ValueError("Paste or type the narration")
+    if len(scenes) > 200:
+        raise ValueError(f"That is {len(scenes)} scenes; use at most 200")
+    slug = pl.slugify(title)
+    p = project_dir(slug, must_exist=False)
+    if (p / "script.json").exists() or busy(slug):
+        abort(409, f"A video with this title already exists ({slug})")
+    p.mkdir(parents=True, exist_ok=True)
+    (p / MANUAL_TEXT).write_text(text, encoding="utf-8")   # kept, so nothing is lost if preparing it fails
+    words = len(" ".join(s["narration"] for s in scenes).split())
+    suggest, factcheck = bool(data.get("suggest", True)), bool(data.get("factcheck", True))
+    pl.save_meta(p, {"topic": title, "minutes": round(words / pl.WORDS_PER_MINUTE, 1), "source": "manual",
+                     "manual": {"suggest": suggest, "factcheck": factcheck}, "created": datetime.now().isoformat()})
+    job = start_manual_job(slug, title, suggest, factcheck)
+    return jsonify({"slug": slug, "job": job.to_dict(), "scenes": len(scenes)})
+
+
+def start_manual_job(slug: str, title: str, suggest: bool, factcheck: bool) -> Job:
+    label = "Prepare your script" + (" and fact-check it" if factcheck else "")
+    return enqueue(slug, "create", label, job_create_manual, slug=slug, title=title, suggest=suggest,
+                   factcheck=factcheck)
+
+
+@app.post("/api/projects/<slug>/prepare")
+def api_prepare_again(slug):
+    """Try again to prepare a script you pasted, after a failure (the text is in my_script.txt)."""
+    p = project_dir(slug)
+    meta = pl.load_meta(p)
+    if (p / "script.json").exists() or not (p / MANUAL_TEXT).exists():
+        abort(409, "There is no pasted script waiting to be prepared")
+    opts = meta.get("manual") or {}
+    job = start_manual_job(slug, meta.get("topic") or slug, bool(opts.get("suggest", True)),
+                           bool(opts.get("factcheck", True)))
+    return jsonify(job.to_dict())
 
 
 @app.get("/api/projects/<slug>")

@@ -158,22 +158,75 @@ async function route() {
 // ---------------------------------------------------------------- videos list
 async function showProjects() {
   S.slug = null; S.project = null; S.draft = null;
+  const box = h("div", { class: "panel stack" });
+  const draw = () => {
+    const mode = S.newMode || "claude";
+    const seg = (k, label) => h("button", { type: "button", class: mode === k ? "active" : "",
+      onclick: () => { S.newMode = k; draw(); } }, label);
+    box.replaceChildren(
+      h("div", { class: "row between" }, h("h2", { style: "margin:0" }, "New video"),
+        h("div", { class: "seg" }, seg("claude", "Claude writes the script"), seg("manual", "I have the script"))),
+      mode === "manual" ? manualForm() : claudeForm());
+  };
+  draw();
+  $app.replaceChildren(box, h("div", { id: "perf" }), h("h2", {}, "Videos"),
+    h("div", { id: "cards", class: "cards" }, h("p", { class: "muted" }, "Loading…")));
+  await refreshProjectCards();
+}
+
+function claudeForm() {
   const topic = h("input", { class: "grow", placeholder: "Topic, e.g. Why do stars twinkle?", required: true, maxlength: 200 });
   const minutes = h("input", { type: "number", min: 1, max: 30, step: 0.5, value: 6, style: "width:5.5rem" });
-  const form = h("form", { class: "panel stack", onsubmit: async e => {
+  return h("form", { class: "stack", onsubmit: async e => {
     e.preventDefault();
     try {
       const r = await api("POST", "/api/projects", { topic: topic.value, minutes: Number(minutes.value) });
       location.hash = `#/p/${r.slug}`;
     } catch (err) { toast(err.message, true); }
   } },
-    h("h2", {}, "New video"),
     h("div", { class: "row" }, topic, h("label", { class: "row" }, minutes, h("span", { class: "muted small" }, "minutes")),
       h("button", { class: "primary", type: "submit" }, "Write script")),
     h("p", { class: "muted small" }, "Claude writes the script and fact-checks it with web searches (a few cents). Nothing is narrated or spent on ElevenLabs until you approve the script."));
-  $app.replaceChildren(form, h("div", { id: "perf" }), h("h2", {}, "Videos"),
-    h("div", { id: "cards", class: "cards" }, h("p", { class: "muted" }, "Loading…")));
-  await refreshProjectCards();
+}
+
+// Rough preview of how a pasted script will be split (the server does the real split)
+function manualStats(text) {
+  const w = words(text);
+  if (!w) return "Separate scenes with a blank line, or start lines with “Scene 1:”, “Scene 2:”…";
+  const body = text.split("\n").filter(l => !/^\s*[\[(]?\s*visual\s*[:\-–—]/i.test(l)).join("\n");
+  const blocks = body.split(/\n\s*\n|\n(?=\s*[\[(]?\s*scene\s*\d)/i).filter(b => b.trim()).length;
+  const scenes = blocks > 1 ? `${blocks} scenes` : w > 50 ? `about ${Math.max(2, Math.round(w / 30))} scenes (split automatically into about two sentences each)` : "1 scene";
+  return `${w} words · ${body.trim().length} characters · ~${(w / WPM).toFixed(1)} min · ${scenes}`;
+}
+
+function manualForm() {
+  const title = h("input", { placeholder: "Title, e.g. The day the Moon saved Earth", required: true, maxlength: 100, style: "width:100%" });
+  const stats = h("div", { class: "muted small" }, manualStats(""));
+  const text = h("textarea", { rows: 12, required: true, placeholder:
+    "Scene 1: Four billion years ago, a day on Earth lasted just six hours.\nVisual: nasa: early Earth\n\n" +
+    "Scene 2: The Moon was much closer then, and its pull raised enormous tides.\nVisual: giant ocean waves\n\n" +
+    "…or paste the whole speech as one block and it is split into scenes for you.",
+    oninput: () => { stats.textContent = manualStats(text.value); } });
+  const suggest = h("input", { type: "checkbox", checked: true });
+  const check = h("input", { type: "checkbox", checked: true });
+  return h("form", { class: "stack", onsubmit: async e => {
+    e.preventDefault();
+    try {
+      const r = await api("POST", "/api/projects", { mode: "manual", title: title.value, script: text.value,
+        suggest: suggest.checked, factcheck: check.checked });
+      location.hash = `#/p/${r.slug}`;
+    } catch (err) { toast(err.message, true); }
+  } },
+    h("label", {}, h("span", {}, "Title"), title),
+    h("label", {}, h("span", {}, "Narration, exactly as it should be spoken"), text),
+    stats,
+    h("p", { class: "muted small" }, "Optional: under a scene, add a line “Visual: ocean waves” to choose its visual search ",
+      "(“Visual: nasa: Saturn rings” for NASA images, “Visual: photo: old map” for a still photo)."),
+    h("label", { class: "row" }, suggest, h("span", { style: "margin:0" },
+      "Let Claude choose visuals for the other scenes and write the description, tags and thumbnail text (about a cent; your narration is not changed)")),
+    h("label", { class: "row" }, check, h("span", { style: "margin:0" },
+      "Fact-check it with web searches (a few cents). You review the findings before anything is narrated.")),
+    h("div", { class: "row" }, h("button", { class: "primary", type: "submit" }, "Create video")));
 }
 
 function perfPanel(projects) {
@@ -376,6 +429,13 @@ function nextStep(p) {
     ? h("div", { class: "muted small" }, `Last unattended run failed: ${p.attempts.errors[p.attempts.errors.length - 1]}`) : null;
   switch (p.step) {
     case "empty":
+      if (p.source === "manual") {
+        return box("bad", "Preparing your script failed or was interrupted (see the Log tab). Your text is saved in the project as my_script.txt.",
+          h("button", { class: "primary", onclick: async () => {
+            try { watchProjectJob(await api("POST", `/api/projects/${encodeURIComponent(p.slug)}/prepare`)); renderProject(); }
+            catch (e) { toast(e.message, true); }
+          } }, "Try again"));
+      }
       return box("bad", h("div", {}, "The script has not been written yet (the last attempt failed or was interrupted).", failures),
         h("button", { class: "primary", onclick: async () => {
           try {
@@ -502,6 +562,25 @@ function sceneEditor(s, i) {
   const chipBox = h("span", {}, audioChip(state));
   const stats = h("span", { class: "muted small" }, sceneStats(s.narration));
   const move = delta => { const j = i + delta; [d.scenes[i], d.scenes[j]] = [d.scenes[j], d.scenes[i]]; markDirty(); renderScenes(); };
+  const ta = h("textarea", { rows: 3, oninput: e => {
+    s.narration = e.target.value; markDirty();
+    stats.textContent = sceneStats(s.narration);
+    chipBox.replaceChildren(audioChip(audioState(s).state));
+    updateTotals();
+  } }, s.narration);
+  const split = () => {
+    const pos = ta.selectionStart, before = s.narration.slice(0, pos).trim(), after = s.narration.slice(pos).trim();
+    if (!before || !after) { toast("Click in the text where the new scene should start, then press ✂"); return; }
+    s.narration = before;
+    d.scenes.splice(i + 1, 0, { narration: after, visual: { source: s.visual.source, query: s.visual.query }, _orig: null });
+    markDirty(); renderScenes();
+  };
+  const join = () => {
+    const next = d.scenes[i + 1];
+    if (audioState(next).state !== "new" && !confirm(`Join scene ${i + 2} onto scene ${i + 1}? Scene ${i + 2}'s narration clip and visual move to the project's .trash folder when you save, and the joined scene is narrated again.`)) return;
+    s.narration = `${s.narration.trim()} ${next.narration.trim()}`.trim();
+    d.scenes.splice(i + 1, 1); markDirty(); renderScenes();
+  };
   return h("div", { class: "scene" },
     h("div", { class: "head" },
       h("span", { class: "num" }, `Scene ${i + 1}`), chipBox,
@@ -512,6 +591,8 @@ function sceneEditor(s, i) {
             s.narration.trim().length) }, "Re-voice") : null,
         h("button", { class: "small", title: "Move up", disabled: i === 0, onclick: () => move(-1) }, "↑"),
         h("button", { class: "small", title: "Move down", disabled: i === n - 1, onclick: () => move(1) }, "↓"),
+        h("button", { class: "small", title: "Split this scene in two where the text cursor is", onclick: split }, "✂"),
+        h("button", { class: "small", title: "Join the next scene onto this one", disabled: i === n - 1, onclick: join }, "⤓"),
         h("button", { class: "small", title: "Add a scene below", onclick: () => {
           d.scenes.splice(i + 1, 0, { narration: "", visual: { source: s.visual.source, query: "" }, _orig: null });
           markDirty(); renderScenes();
@@ -520,12 +601,7 @@ function sceneEditor(s, i) {
           if (state !== "new" && !confirm(`Delete scene ${i + 1}? Its narration clip and visual move to the project's .trash folder when you save.`)) return;
           d.scenes.splice(i, 1); markDirty(); renderScenes();
         } }, "✕"))),
-    h("textarea", { rows: 3, oninput: e => {
-      s.narration = e.target.value; markDirty();
-      stats.textContent = sceneStats(s.narration);
-      chipBox.replaceChildren(audioChip(audioState(s).state));
-      updateTotals();
-    } }, s.narration),
+    ta,
     h("div", { class: "visual-row" }, stats),
     h("div", { class: "visual-row" },
       h("select", { onchange: e => { s.visual.source = e.target.value; markDirty(); } },

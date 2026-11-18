@@ -86,7 +86,7 @@ def configure() -> None:
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
     global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
     global FAL_KEY, AI_VISUALS, AI_IMAGE_MODEL, AI_VIDEO_MODEL, AI_IMAGE_COST, AI_VIDEO_COST
-    global RENDER_JOBS, SHOT_SECONDS, AUTO_CHAPTERS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    global RENDER_JOBS, SHOT_SECONDS, AUTO_CHAPTERS, CAPTION_LANGUAGES, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
     FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
@@ -125,6 +125,8 @@ def configure() -> None:
     RENDER_JOBS = int(os.getenv("RENDER_JOBS") or 0)   # scenes rendered at once; 0 = automatic
     SHOT_SECONDS = float(os.getenv("SHOT_SECONDS") or 0)   # a long scene gets a new shot about this often; 0 = off
     AUTO_CHAPTERS = _flag("AUTO_CHAPTERS", True)   # Claude suggests chapters at render time if there are none
+    # Extra caption languages: translated captions, title and description are added to uploaded videos
+    CAPTION_LANGUAGES = [c.strip() for c in os.getenv("CAPTION_LANGUAGES", "").split(",") if c.strip()]
     YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
     YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
     THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
@@ -2263,11 +2265,11 @@ def estimated_timings(text: str, speech: float) -> list[tuple[str, float, float]
     return out
 
 
-def scene_words(project: Path, i: int, scene: dict, tl: dict) -> list[tuple[str, float, float]]:
-    """(word, start, end) for one scene, from the saved ElevenLabs timing or estimated."""
+def scene_words(project: Path, i: int, scene: dict, tl: dict, estimate: bool = False) -> list[tuple[str, float, float]]:
+    """(word, start, end) for one scene, from the saved ElevenLabs timing or estimated (always for translations)."""
     align_path = project / "audio" / f"scene_{i:02d}.json"
     words = None
-    if align_path.exists():
+    if align_path.exists() and not estimate:
         try:
             words = word_timings(load_json(align_path))
         except (ValueError, KeyError, TypeError):
@@ -2276,13 +2278,14 @@ def scene_words(project: Path, i: int, scene: dict, tl: dict) -> list[tuple[str,
 
 
 def build_cues(project: Path, script: dict, timeline: list[dict], scenes: list[int] | None = None,
-               max_words: int = MAX_CUE_WORDS, max_chars: int = MAX_CUE_CHARS) -> list[tuple[float, float, str]]:
+               max_words: int = MAX_CUE_WORDS, max_chars: int = MAX_CUE_CHARS,
+               estimate: bool = False) -> list[tuple[float, float, str]]:
     """Caption cues for the given scenes (all by default), timed from the start of the first one."""
     cues, offset = [], 0.0
     for i in scenes if scenes is not None else range(len(script["scenes"])):
         tl = timeline[i]
         group: list[tuple[str, float, float]] = []
-        for w, s, e in scene_words(project, i, script["scenes"][i], tl):
+        for w, s, e in scene_words(project, i, script["scenes"][i], tl, estimate):
             if group and (len(group) >= max_words or sum(len(g[0]) for g in group) + len(group) + len(w) > max_chars):
                 cues.append((offset + group[0][1], offset + group[-1][2] + 0.15, " ".join(g[0] for g in group)))
                 group = []
@@ -2297,12 +2300,150 @@ def build_cues(project: Path, script: dict, timeline: list[dict], scenes: list[i
     return cues
 
 
-def write_srt(project: Path, script: dict, timeline: list[dict]) -> Path:
+def write_srt(project: Path, script: dict, timeline: list[dict], path: Path | None = None,
+              estimate: bool = False) -> Path:
     entries = [f"{n}\n{srt_time(s)} --> {srt_time(e)}\n{text}\n"
-               for n, (s, e, text) in enumerate(build_cues(project, script, timeline), start=1)]
-    path = project / "captions.srt"
+               for n, (s, e, text) in enumerate(build_cues(project, script, timeline, estimate=estimate), start=1)]
+    path = path or project / "captions.srt"
     path.write_text("\n".join(entries), encoding="utf-8")
     return path
+
+
+# ----------------------------------------------------------------------------
+# Other languages: translated captions, title and description for an uploaded video, and dubbed versions
+# ----------------------------------------------------------------------------
+class Translation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(description="The translated YouTube title, at most 90 characters")
+    description: str = Field(description="The translated description")
+    tags: List[str] = Field(description="The tags, translated")
+    thumbnail_text: str = Field(description="The thumbnail text, translated, 2-5 punchy words")
+    scenes: List[str] = Field(description="Every scene's narration translated, in the same order")
+
+
+def script_hash(script: dict) -> str:
+    parts = [script.get("title", ""), script.get("description", ""), script.get("thumbnail_text", ""),
+             *script.get("tags", []), *(s["narration"] for s in script["scenes"])]
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+
+
+def translate_script(project: Path, script: dict, language: str) -> dict:
+    """Claude translates the narration (scene by scene), title, description, tags and thumbnail text.
+    Kept in translations/<language>.json and reused until the script changes."""
+    if language not in LANGUAGES:
+        raise ValueError(f"Unknown language: {language}")
+    cache = project / "translations" / f"{language}.json"
+    digest = script_hash(script)
+    if cache.exists():
+        saved = load_json(cache)
+        if saved.get("hash") == digest:
+            return saved["translation"]
+    name = LANGUAGES[language]
+    n = len(script["scenes"])
+    numbered = "\n".join(f"{i}. {s['narration']}" for i, s in enumerate(script["scenes"]))
+    prompt = f"""Translate this YouTube video into {name}.
+
+Title: {script.get('title', '')}
+Thumbnail text: {script.get('thumbnail_text', '')}
+Tags: {', '.join(script.get('tags', []))}
+Description:
+{script.get('description', '')}
+
+Narration, {n} scenes numbered from 0:
+{numbered}
+
+The narration will be read aloud by a narrator, so write natural spoken {name}, not a word-for-word rendering. Keep every fact, number and unit exactly, keep proper names, and keep each scene about the same length. Return exactly {n} scene translations, in order."""
+    log(f"Translating into {name}")
+    result = claude_json(ANTHROPIC_MODEL, f"You are a professional translator of documentaries into {name}.",
+                         prompt, Translation).model_dump()
+    if len(result["scenes"]) != n:
+        raise RuntimeError(f"The {name} translation has {len(result['scenes'])} scenes instead of {n}; try again")
+    cache.parent.mkdir(exist_ok=True)
+    save_json(cache, {"hash": digest, "translation": result})
+    return result
+
+
+def translated_script(script: dict, tr: dict) -> dict:
+    return dict(script, title=tr["title"][:100], description=tr["description"], tags=tr["tags"],
+                thumbnail_text=tr["thumbnail_text"],
+                scenes=[dict(s, narration=t.strip()) for s, t in zip(script["scenes"], tr["scenes"])])
+
+
+def write_translated_captions(project: Path, script: dict, timeline: list[dict], language: str) -> Path:
+    """captions_<language>.srt: each scene's translation spread over the time its narration is spoken."""
+    tr = translate_script(project, script, language)
+    return write_srt(project, translated_script(script, tr), timeline, project / f"captions_{language}.srt",
+                     estimate=True)
+
+
+def upload_translations(project: Path, script: dict, assets: list[dict], languages: list[str], interactive=False) -> dict:
+    """Add translated captions and a translated title and description to the uploaded video."""
+    from googleapiclient.http import MediaFileUpload
+    video_id = load_json(project / "youtube.json")["video_id"]
+    timeline = load_json(project / "timeline.json")
+    youtube = get_youtube(interactive=interactive)
+    own = video_language(project)
+    localizations, done = {}, {}
+    for lang in languages:
+        if lang == own:
+            continue
+        srt = write_translated_captions(project, script, timeline, lang)
+        tr = translate_script(project, script, lang)
+        try:
+            youtube.captions().insert(
+                part="snippet", body={"snippet": {"videoId": video_id, "language": lang, "name": LANGUAGES[lang],
+                                                  "isDraft": False}},
+                media_body=MediaFileUpload(str(srt), mimetype="application/octet-stream")).execute()
+            done[lang] = "captions"
+            log(f"{LANGUAGES[lang]} captions uploaded")
+        except Exception as e:
+            log(f"{LANGUAGES[lang]} captions not uploaded ({str(e)[:200]})")
+        localizations[lang] = {"title": clean_text(tr["title"])[:100],
+                               "description": build_description(dict(script, description=tr["description"],
+                                                                     chapters=None), assets)}
+    if localizations:
+        try:
+            youtube.videos().update(part="localizations",
+                                    body={"id": video_id, "localizations": localizations}).execute()
+            log(f"Translated title and description added: {', '.join(LANGUAGES[l] for l in localizations)}")
+            done.update({lang: done.get(lang, "") + "+title" for lang in localizations})
+        except Exception as e:
+            log(f"Translated titles not added ({str(e)[:200]})")
+    record = load_json(project / "youtube.json")
+    record["translations"] = dict(record.get("translations") or {}, **done)
+    save_json(project / "youtube.json", record)
+    return done
+
+
+def make_dub(project: Path, language: str) -> Path:
+    """A new video in another language: same visuals and music, translated script (to review before it is
+    narrated). Returns the new project folder."""
+    script = load_json(project / "script.json")
+    if video_language(project) == language:
+        raise ValueError(f"This video is already in {LANGUAGES.get(language, language)}")
+    dest = project.parent / f"{project.name}-{language.lower()}"
+    if (dest / "script.json").exists():
+        raise RuntimeError(f"There is already a {LANGUAGES[language]} version: {dest.name}")
+    tr = translate_script(project, script, language)
+    dest.mkdir(parents=True, exist_ok=True)
+    if (project / "assets").exists():
+        shutil.copytree(project / "assets", dest / "assets", dirs_exist_ok=True)
+    manifest = load_manifest(project)
+    for asset in manifest:
+        for a in ([asset] + (asset.get("shots") or [])) if asset else []:
+            if a and a.get("path"):
+                a["path"] = str(dest / "assets" / Path(a["path"]).name)
+    save_json(dest / "assets.json", manifest)
+    new = translated_script(script, tr)
+    new.pop("chapters", None)   # chapter titles are suggested again in the new language
+    save_json(dest / "script.json", new)
+    meta = load_meta(project)
+    save_meta(dest, {k: v for k, v in meta.items() if k in ("channel", "music", "music_auto")} |
+              {"topic": tr["title"], "language": language, "translation_of": project.name, "source": "translation",
+               "created": datetime.now().isoformat()})
+    write_review(dest, new, {})
+    log(f"{LANGUAGES[language]} version created: {dest.name}. Review it, then generate its voiceover.")
+    return dest
 
 
 # ----------------------------------------------------------------------------
@@ -2798,6 +2939,9 @@ def settings_problems() -> list[str]:
     for name, model in (("AI_IMAGE_MODEL", AI_IMAGE_MODEL), ("AI_VIDEO_MODEL", AI_VIDEO_MODEL)):
         if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{2,120}", model):
             problems.append(f"{name} '{model}' does not look like a fal.ai model id (e.g. fal-ai/flux/dev)")
+    bad_langs = [c for c in CAPTION_LANGUAGES if c not in LANGUAGES]
+    if bad_langs:
+        problems.append(f"CAPTION_LANGUAGES has unknown codes ({', '.join(bad_langs)}); use: {', '.join(LANGUAGES)}")
     unknown = [p for p in VISUAL_PROVIDERS if p not in PROVIDERS]
     if unknown:
         problems.append(f"VISUAL_PROVIDERS has unknown names ({', '.join(unknown)}); use: {', '.join(PROVIDERS)}")
@@ -2907,6 +3051,11 @@ def process(project: Path, topic: str | None, args) -> None:
     video_id = upload(project, script, assets, args)
     save_json(uploaded, {"video_id": video_id, "url": f"https://youtu.be/{video_id}",
                          "uploaded_at": datetime.now().isoformat()})
+    if CAPTION_LANGUAGES:
+        try:
+            upload_translations(project, script, assets, CAPTION_LANGUAGES, interactive=not args.yes)
+        except Exception as e:   # the video itself is uploaded; translations can be added later
+            log(f"Translations not added ({type(e).__name__}: {str(e)[:200]})")
     log("All done. The video is private/scheduled: watch it in YouTube Studio before it goes public.")
 
 

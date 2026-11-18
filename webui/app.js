@@ -892,7 +892,8 @@ function videoTab(p) {
         p.captions_url ? h("a", { class: "btn small", href: p.captions_url, download: `${p.slug}.srt` }, "Download captions") : null)) : null,
     chaptersPanel(p),
     thumbnailPanel(p),
-    uploadPanel(p, st, "video"));
+    uploadPanel(p, st, "video"),
+    languagesPanel(p));
 }
 
 function clock(sec) {
@@ -931,6 +932,36 @@ function chaptersPanel(p) {
     h("p", { class: "muted small" }, lines.length
       ? `On upload, the description gets: ${lines.join(" · ")}`
       : "YouTube needs at least 3 chapters, the first at 0:00, each at least 10 seconds long; until then none are added to the description."));
+}
+
+function languagesPanel(p) {
+  const langs = S.status.languages || {};
+  const tr = p.translations || { languages: [], files: {}, uploaded: {} };
+  const others = Object.entries(langs).filter(([k]) => k !== p.language);
+  const pick = h("select", {}, others.map(([k, name]) => h("option", { value: k }, name)));
+  const voiced = p.voice_todo.length === 0;
+  return h("div", { class: "panel stack" }, h("h2", {}, "Other languages"),
+    p.translation_of ? h("p", { class: "small" }, "This is the ", langs[p.language] || p.language, " version of ",
+      h("a", { href: `#/p/${p.translation_of}` }, p.translation_of), ".") : null,
+    h("div", {}, h("strong", {}, "Translated captions, title and description "),
+      h("span", { class: "muted small" }, "(languages are chosen in Settings; about a cent per language)")),
+    tr.languages.length ? h("div", { class: "row" },
+      tr.languages.filter(l => l !== p.language).map(l => h("span", {},
+        tr.files[l] ? h("a", { class: "chip ok", href: tr.files[l], download: `${p.slug}.${l}.srt` }, `${langs[l] || l} ✓`) : chip(langs[l] || l),
+        tr.uploaded[l] ? chip("on YouTube", "ok") : null)),
+      h("button", { class: "small", disabled: !voiced, onclick: () => startJob("translate", null,
+        p.youtube ? "Translate the captions, title and description and add them to the video on YouTube (about a cent per language)?"
+          : "Translate the captions now (about a cent per language)? They are added to the video when it is uploaded.") },
+        p.youtube ? "Translate and add to YouTube" : "Translate now"))
+      : h("p", { class: "muted small" }, "No caption languages chosen. Pick some in Settings and they are added automatically when you upload."),
+    h("div", { class: "row" }, h("strong", {}, "Dubbed version"),
+      h("span", { class: "muted small" }, "A new video with the same visuals and music and a translated script for you to review; its narration costs ElevenLabs characters like any video.")),
+    h("div", { class: "row" }, pick,
+      h("button", { onclick: () => startJob("dub", { language: pick.value },
+        `Create a ${langs[pick.value]} version of this video? Claude translates the script (about a cent); nothing is narrated until you approve it.`) },
+        "Make this version")),
+    p.dubs && p.dubs.length ? h("div", { class: "row" }, h("span", { class: "muted small" }, "Versions:"),
+      p.dubs.map(d => h("a", { class: "btn small", href: `#/p/${d.slug}` }, `${langs[d.language] || d.language}: ${d.title}`))) : null);
 }
 
 function trackName(path) { return String(path).split("/").pop(); }
@@ -1197,6 +1228,14 @@ function renderSettings(voiced) {
             .map(([k, label]) => h("option", { value: k, selected: Number(v.SHOT_SECONDS) === k ? true : null }, label))))),
     providersPanel(vals),
     aiPanel(vals),
+    h("div", { class: "panel stack" }, h("h2", {}, "Caption languages"),
+      h("p", { class: "muted small" }, "When a video is uploaded, Claude translates its captions, title and description into these languages and adds them to the video (about a cent per language), so viewers can watch with subtitles and find it in their language."),
+      h("div", { class: "row" }, Object.entries(st.languages || {}).map(([k, name]) => h("label", { class: "row", style: "gap:.3rem" },
+        h("input", { type: "checkbox", checked: (vals.CAPTION_LANGUAGES || []).includes(k), onchange: e => {
+          const set = new Set(vals.CAPTION_LANGUAGES || []);
+          e.target.checked ? set.add(k) : set.delete(k);
+          vals.CAPTION_LANGUAGES = [...set];
+        } }), h("span", { style: "margin:0" }, name))))),
     h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { if (await save()) renderSettings(voiced); } }, "Save settings")),
     statusPanel(st));
 }

@@ -281,6 +281,11 @@ def project_state(slug: str, detail: bool = False) -> dict:
     state.update({
         "short": short_state(slug, p, script, timeline_for(p, script) if script else [], meta, newest_input),
         "chapter_lines": pl.chapter_lines(script, scene_tl) if script else [],
+        "translations": {"languages": pl.CAPTION_LANGUAGES,
+                         "files": {lang: file_url(slug, p / f"captions_{lang}.srt") for lang in pl.CAPTION_LANGUAGES},
+                         "uploaded": (youtube or {}).get("translations") or {}},
+        "translation_of": meta.get("translation_of"),
+        "dubs": dubs_of(slug),
         "music": {"choice": meta.get("music"), "auto": bool(meta.get("music_auto")),
                   "track": track.name if track else None, "default": pl.describe_default_music()},
         "script": script, "factcheck": pl.load_json(check_path) if check_path.exists() else None,
@@ -308,6 +313,16 @@ def short_state(slug: str, p: Path, script: dict | None, timeline: list[dict], m
                 state="missing" if not video.exists() else "outdated" if mtime(video) < changed else "ready",
                 youtube=pl.load_json(yt) if yt.exists() else None, max_seconds=pl.SHORT_MAX_SECONDS,
                 target_seconds=pl.SHORT_TARGET_SECONDS)
+
+
+def dubs_of(slug: str) -> list[dict]:
+    """Versions of this video in other languages."""
+    out = []
+    for d in sorted(pl.PROJECTS_DIR.iterdir()) if pl.PROJECTS_DIR.exists() else []:
+        meta = pl.load_meta(d) if d.is_dir() else {}
+        if meta.get("translation_of") == slug:
+            out.append({"slug": d.name, "language": meta.get("language"), "title": meta.get("topic", d.name)})
+    return out
 
 
 def list_projects() -> list[dict]:
@@ -642,9 +657,37 @@ def job_upload(slug: str, privacy: str, publish_at: str | None, synthetic: bool)
     if project_state(slug)["video"] != "ready":
         raise RuntimeError("The video is missing or outdated. Render it first.")
     args = SimpleNamespace(yes=True, privacy=privacy, publish_at=publish_at, synthetic=synthetic)
-    video_id = pl.upload(p, script, pl.load_manifest(p)[:len(script["scenes"])], args)
+    assets = pl.load_manifest(p)[:len(script["scenes"])]
+    video_id = pl.upload(p, script, assets, args)
     pl.save_json(p / "youtube.json", {"video_id": video_id, "url": f"https://youtu.be/{video_id}",
                                       "uploaded_at": datetime.now().isoformat()})
+    if pl.CAPTION_LANGUAGES:
+        try:
+            pl.upload_translations(p, script, assets, pl.CAPTION_LANGUAGES)
+        except Exception as e:   # the video is uploaded; translations can be added later from the Video tab
+            pl.log(f"Translations not added ({type(e).__name__}: {str(e)[:200]})")
+
+
+def job_translate(slug: str) -> None:
+    p = pl.PROJECTS_DIR / slug
+    script = need_script(p)
+    if not pl.CAPTION_LANGUAGES:
+        raise RuntimeError("Choose caption languages in Settings first")
+    if not (p / "timeline.json").exists() or pl.voiceover_todo(p, script):
+        raise RuntimeError("Generate the voiceover first; the captions are timed to it")
+    if (p / "youtube.json").exists():
+        pl.upload_translations(p, script, pl.load_manifest(p)[:len(script["scenes"])], pl.CAPTION_LANGUAGES)
+    else:
+        timeline = pl.load_json(p / "timeline.json")
+        for lang in pl.CAPTION_LANGUAGES:
+            if lang != pl.video_language(p):
+                pl.write_translated_captions(p, script, timeline, lang)
+        pl.log("Translated captions are ready; they are added to the video when it is uploaded")
+
+
+def job_dub(slug: str, language: str) -> None:
+    dest = pl.make_dub(pl.PROJECTS_DIR / slug, language)
+    pl.log(f"Open it from the Videos page: {dest.name}")
 
 
 # ----------------------------------------------------------------------------
@@ -829,6 +872,7 @@ ACTIONS = {
     "thumbnail": ("Update the thumbnail", job_thumbnail),
     "short": ("Make the Short", job_short),
     "chapters": ("Suggest chapters", job_chapters),
+    "translate": ("Translate the captions", job_translate),
 }
 
 
@@ -870,6 +914,11 @@ def api_start_job(slug):
     elif action == "find_visual":
         i = scene_index()
         job = enqueue(slug, action, f"Find another visual for scene {i + 1}", job_find_visual, slug=slug, scene=i)
+    elif action == "dub":
+        language = str(data.get("language") or "")
+        if language not in pl.LANGUAGES:
+            raise ValueError("Unknown language")
+        job = enqueue(slug, action, f"Make a {pl.LANGUAGES[language]} version", job_dub, slug=slug, language=language)
     elif action == "generate_visual":
         i = scene_index()
         kind = data.get("kind", "image")
@@ -1183,7 +1232,7 @@ SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float", "SHOT_SECONDS": "float",
-    "AUTO_CHAPTERS": "bool",
+    "AUTO_CHAPTERS": "bool", "CAPTION_LANGUAGES": "languages",
     "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
     "AI_VISUALS": "choice", "AI_IMAGE_MODEL": "text", "AI_VIDEO_MODEL": "text", "AI_IMAGE_COST": "float",
     "AI_VIDEO_COST": "float",
@@ -1213,6 +1262,7 @@ def current_settings() -> dict:
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
             "CROSSFADE": pl.CROSSFADE, "SHOT_SECONDS": pl.SHOT_SECONDS, "AUTO_CHAPTERS": pl.AUTO_CHAPTERS,
+            "CAPTION_LANGUAGES": pl.CAPTION_LANGUAGES,
             "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
             "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK, "AI_VISUALS": pl.AI_VISUALS,
             "AI_IMAGE_MODEL": pl.AI_IMAGE_MODEL, "AI_VIDEO_MODEL": pl.AI_VIDEO_MODEL,
@@ -1354,6 +1404,10 @@ def api_save_settings():
             updates[key] = str(value).strip().lower()
         elif kind == "text":
             updates[key] = " ".join(str(value or "").split())[:200]
+        elif kind == "languages":
+            if not isinstance(value, list) or not all(v in pl.LANGUAGES for v in value):
+                raise ValueError("Unknown caption language")
+            updates[key] = ",".join(dict.fromkeys(value))
         elif kind == "providers":
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ValueError(f"{key} must be a list of provider names")

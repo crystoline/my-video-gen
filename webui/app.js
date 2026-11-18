@@ -660,7 +660,17 @@ function visualCard(s, i) {
   if (!a || !a.url) media = h("div", { class: "media" }, "No visual yet");
   else if (a.kind === "video") media = h("div", { class: "media" }, h("video", { src: a.url, muted: true, loop: true, controls: true, preload: "metadata" }));
   else media = h("div", { class: "media" }, h("img", { src: a.url, alt: "", loading: "lazy" }));
-  return h("div", { class: "vcard" }, media,
+  const wanted = info ? info.shots_wanted || 1 : 1;
+  const extras = a && wanted > 1 ? h("div", { class: "shots" },
+    Array.from({ length: wanted - 1 }, (_, k) => {
+      const sh = (a.shots || [])[k];
+      const n = k + 2;
+      return h("div", { class: "shot" },
+        h("div", { class: "smedia" }, sh && sh.url ? (sh.kind === "video" ? h("video", { src: sh.url, muted: true, preload: "metadata" })
+          : h("img", { src: sh.url, alt: "", loading: "lazy" })) : h("span", { class: "muted small" }, "fetched at render")),
+        h("button", { class: "small", title: sh ? sh.credit : "", onclick: () => openPicker(i, n) }, `Shot ${n}…`));
+    })) : null;
+  return h("div", { class: "vcard" }, media, extras,
     h("div", { class: "body" },
       h("div", { class: "row between" }, h("strong", {}, `Scene ${i + 1}`),
         h("span", {}, a ? chip(a.source === "custom" ? "your file" : a.source === "ai" ? `AI ${a.kind}` : a.kind, a.source === "ai" ? "warn" : "") : null,
@@ -685,7 +695,8 @@ function visualCard(s, i) {
 }
 
 // ---------------------------------------------------------------- visual picker
-async function openPicker(i) {
+async function openPicker(i, shot) {
+  shot = shot || 1;
   if (S.dirty && !(await saveDraft())) return;   // scene numbers must match the saved script
   const s = S.draft.scenes[i];
   const slug = S.slug;
@@ -804,14 +815,15 @@ async function openPicker(i) {
   }
 
   function pick(c) {
-    if (c.current) { toast("That is already this scene's visual"); return; }
+    if (c.current && shot === 1) { toast("That is already this scene's visual"); return; }
     if (c.used_in && !confirm(`Scene ${c.used_in} already uses this. Use it for scene ${i + 1} too?`)) return;
     close();
-    startJob("pick_visual", { scene: i, candidate: c.id, query: q.value.trim() });
+    startJob("pick_visual", { scene: i, candidate: c.id, query: q.value.trim(), shot });
   }
 
-  overlay.append(h("div", { class: "modal panel", role: "dialog", "aria-label": `Choose a visual for scene ${i + 1}` },
-    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, `Choose a visual for scene ${i + 1}`),
+  const heading = shot > 1 ? `Choose shot ${shot} for scene ${i + 1}` : `Choose a visual for scene ${i + 1}`;
+  overlay.append(h("div", { class: "modal panel", role: "dialog", "aria-label": heading },
+    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, heading),
       h("button", { class: "small", onclick: close }, "Close")),
     h("div", { class: "narr muted small" }, s.narration),
     h("form", { class: "row", onsubmit: e => { e.preventDefault(); search(1); } },
@@ -1105,7 +1117,11 @@ function renderSettings(voiced) {
           h("span", { style: "margin:0" }, "Speaker boost (off can sound less harsh)"))),
       h("p", { class: "muted small" }, "These only affect narration generated after you save. To hear them on an existing scene, use Re-voice on the Script tab (it costs that scene's characters).")),
     h("div", { class: "panel stack" }, h("h2", {}, "Video"),
-      h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1))),
+      h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1)),
+      h("label", {}, h("span", {}, "Extra shots for long scenes (keeps the picture moving; extra visuals are fetched automatically)"),
+        h("select", { onchange: e => { vals.SHOT_SECONDS = Number(e.target.value); } },
+          [[0, "Off: one visual per scene"], [8, "A new shot about every 8 s"], [10, "About every 10 s"], [12, "About every 12 s"], [15, "About every 15 s"]]
+            .map(([k, label]) => h("option", { value: k, selected: Number(v.SHOT_SECONDS) === k ? true : null }, label))))),
     providersPanel(vals),
     aiPanel(vals),
     h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { if (await save()) renderSettings(voiced); } }, "Save settings")),

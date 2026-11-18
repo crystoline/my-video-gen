@@ -127,6 +127,10 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 .vcard .media { aspect-ratio: 16 / 9; background: #000; display: flex; align-items: center; justify-content: center; color: #aaa; }
 .vcard .media img, .vcard .media video { width: 100%; height: 100%; object-fit: cover; }
 .vcard .body { padding: .65rem .75rem; display: flex; flex-direction: column; gap: .4rem; }
+.vcard .shots { display: flex; gap: .4rem; padding: .4rem .75rem 0; }
+.vcard .shot { flex: 1 1 0; display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+.vcard .smedia { aspect-ratio: 16 / 9; background: #000; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.vcard .smedia img, .vcard .smedia video { width: 100%; height: 100%; object-fit: cover; }
 .vcard .narr { font-size: .85rem; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 .warn-text { color: var(--warn); }

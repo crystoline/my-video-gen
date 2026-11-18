@@ -251,6 +251,7 @@ def project_state(slug: str, detail: bool = False) -> dict:
         return state
     tl_path = p / "timeline.json"
     timeline = pl.load_json(tl_path) if tl_path.exists() else []
+    scene_tl = timeline_for(p, script) if script else []
     scene_info = []
     for i, scene in enumerate(scenes):
         f = pl.audio_files(p, i)
@@ -263,7 +264,11 @@ def project_state(slug: str, detail: bool = False) -> dict:
             "asset": None if not asset else {
                 "kind": asset.get("kind"), "source": asset.get("source"), "query": asset.get("query"),
                 "credit": asset.get("credit", ""), "id": asset.get("id"),
-                "url": file_url(slug, Path(asset["path"]))},
+                "url": file_url(slug, Path(asset["path"])),
+                "shots": [None if not s else {"kind": s.get("kind"), "source": s.get("source"), "id": s.get("id"),
+                                              "credit": s.get("credit", ""), "url": file_url(slug, Path(s["path"]))}
+                          for s in asset.get("shots") or []]},
+            "shots_wanted": pl.shots_wanted(scene_tl[i]["duration"]) if i < len(scene_tl) else 1,
         })
     check_path = p / "factcheck.json"
     notes_path = p / "factcheck_notes.md"
@@ -378,6 +383,8 @@ def remap_scenes(p: Path, origin: list, old_n: int) -> None:
                 f.replace(d / f"audio.{ext}")
         for f in (p / "assets").glob(f"scene_{i:02d}.*"):
             f.replace(d / f"asset{f.suffix}")
+        for f in (p / "assets").glob(f"scene_{i:02d}_s*.*"):   # extra shots: scene_XX_s2.jpg -> shot2.jpg
+            f.replace(d / f"shot{f.stem.rsplit('_s', 1)[1]}{f.suffix}")
     new_manifest = []
     for j, o in enumerate(origin):
         entry = None
@@ -391,6 +398,11 @@ def remap_scenes(p: Path, origin: list, old_n: int) -> None:
                     f.replace(dest)
                     if o < len(manifest) and manifest[o]:
                         entry = dict(manifest[o], path=str(dest))
+            for f in sorted(d.glob("shot*")):
+                f.replace(p / "assets" / f"scene_{j:02d}_s{f.stem[4:]}{f.suffix}")
+            if entry and entry.get("shots"):
+                entry["shots"] = [dict(s, path=str(p / "assets" / f"scene_{j:02d}_s{k + 2}{Path(s['path']).suffix}"))
+                                  if s else None for k, s in enumerate(entry["shots"])]
         new_manifest.append(entry)
     removed = [i for i in range(old_n) if i not in origin and any((staging / str(i)).iterdir())]
     if removed:
@@ -535,13 +547,13 @@ def job_generate_visual(slug: str, prompt: str, kind: str, count: int) -> None:
     pl.generate_ai_visual(pl.PROJECTS_DIR / slug, prompt, kind, count)
 
 
-def job_pick_visual(slug: str, scene: int, candidate: dict, query: str) -> None:
+def job_pick_visual(slug: str, scene: int, candidate: dict, query: str, shot: int = 1) -> None:
     p = pl.PROJECTS_DIR / slug
     script = need_script(p)
-    pl.use_visual(p, scene, dict(candidate, query=query))
-    # Remember the search that found it, so "Next result" continues from there
+    pl.use_visual(p, scene, dict(candidate, query=query), shot=shot)
+    # Remember the search that found the main visual, so "Next result" continues from there
     visual = script["scenes"][scene].setdefault("visual", {})
-    if query and (visual.get("query") != query or visual.get("source") != candidate["source"]):
+    if shot == 1 and query and (visual.get("query") != query or visual.get("source") != candidate["source"]):
         visual.update(source=candidate["source"], query=query)
         pl.save_json(p / "script.json", script)
 
@@ -845,8 +857,11 @@ def api_start_job(slug):
         if not candidate:   # only results this server found are used, never a URL sent by the browser
             raise ValueError("That search result has expired (the web UI may have restarted). Search again.")
         query = " ".join(str(data.get("query") or "").split())[:100]
-        job = enqueue(slug, action, f"Use the picked visual for scene {i + 1}", job_pick_visual, slug=slug, scene=i,
-                      candidate=dict(candidate), query=query)
+        shot = data.get("shot") or 1
+        if shot not in (1, 2, 3):
+            raise ValueError("Unknown shot")
+        job = enqueue(slug, action, f"Use the picked visual for scene {i + 1}" + (f", shot {shot}" if shot > 1 else ""),
+                      job_pick_visual, slug=slug, scene=i, candidate=dict(candidate), query=query, shot=shot)
     elif action == "preview":
         seconds = float(data.get("seconds") or 45)
         job = enqueue(slug, action, "Preview the sound", job_preview, slug=slug, seconds=min(max(seconds, 5), 300))
@@ -1095,7 +1110,7 @@ def api_requeue():
 SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings are editable here, never keys
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
-    "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float",
+    "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float", "SHOT_SECONDS": "float",
     "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
     "AI_VISUALS": "choice", "AI_IMAGE_MODEL": "text", "AI_VIDEO_MODEL": "text", "AI_IMAGE_COST": "float",
     "AI_VIDEO_COST": "float",
@@ -1124,7 +1139,7 @@ def current_settings() -> dict:
             "VOICE_TONE": pl.VOICE_TONE, "VOICE_STABILITY": pl.VOICE_STABILITY,
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
-            "CROSSFADE": pl.CROSSFADE, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
+            "CROSSFADE": pl.CROSSFADE, "SHOT_SECONDS": pl.SHOT_SECONDS, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
             "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK, "AI_VISUALS": pl.AI_VISUALS,
             "AI_IMAGE_MODEL": pl.AI_IMAGE_MODEL, "AI_VIDEO_MODEL": pl.AI_VIDEO_MODEL,
             "AI_IMAGE_COST": pl.AI_IMAGE_COST, "AI_VIDEO_COST": pl.AI_VIDEO_COST}

@@ -90,6 +90,7 @@ A blank line, or a line starting with `Scene 3:`, starts a new scene; text witho
 - `--project projects/<folder>` resumes a project.
 - `CROSSFADE` in `.env` is the cross-fade length in seconds (default 0.5). Set it to 0 for hard cuts.
 - `RENDER_JOBS` in `.env` sets how many scenes render at the same time (default: a quarter of the CPU cores, 1 to 4).
+- `SHOT_SECONDS` (also in Settings) gives long scenes extra shots: with 10, a 25-second scene shows two different visuals and a 35-second one three, so the picture keeps moving. The extra visuals come from the same search; on the Visuals tab you can change each one.
 
 ## 4. Web interface
 

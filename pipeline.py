@@ -86,7 +86,7 @@ def configure() -> None:
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
     global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
     global FAL_KEY, AI_VISUALS, AI_IMAGE_MODEL, AI_VIDEO_MODEL, AI_IMAGE_COST, AI_VIDEO_COST
-    global RENDER_JOBS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
+    global RENDER_JOBS, SHOT_SECONDS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
     FACTCHECK_SEARCHES = int(os.getenv("FACTCHECK_SEARCHES", "8"))
@@ -123,6 +123,7 @@ def configure() -> None:
     MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
     CROSSFADE = float(os.getenv("CROSSFADE", "0.5"))
     RENDER_JOBS = int(os.getenv("RENDER_JOBS") or 0)   # scenes rendered at once; 0 = automatic
+    SHOT_SECONDS = float(os.getenv("SHOT_SECONDS") or 0)   # a long scene gets a new shot about this often; 0 = off
     YT_CLIENT_SECRETS = _path("YT_CLIENT_SECRETS", "client_secret.json")
     YT_TOKEN = _path("YT_TOKEN", "youtube_token.json")
     THUMB_FONT = str(_path("THUMB_FONT", "")) if os.getenv("THUMB_FONT") else ""
@@ -1272,9 +1273,82 @@ def load_manifest(project: Path) -> list:
     path = project / "assets.json"
     manifest = load_json(path) if path.exists() else []
     for asset in manifest:
-        if asset and asset.get("path"):
-            asset["path"] = str(project / "assets" / Path(asset["path"]).name)
+        for a in ([asset] + (asset.get("shots") or [])) if asset else []:
+            if a and a.get("path"):
+                a["path"] = str(project / "assets" / Path(a["path"]).name)
     return manifest
+
+
+def shots_wanted(duration: float) -> int:
+    """How many different visuals a scene shows: one, or with SHOT_SECONDS set, one per that many seconds (max 3)."""
+    if SHOT_SECONDS <= 0:
+        return 1
+    return min(3, max(1, int(duration // SHOT_SECONDS)))
+
+
+def scene_shots(asset: dict, duration: float) -> list[dict]:
+    """The visuals a scene shows, in order: its main visual plus the extra shots it needs and has."""
+    extras = [s for s in (asset.get("shots") or []) if s and Path(s.get("path", "")).exists()]
+    return [asset] + extras[:shots_wanted(duration) - 1]
+
+
+def store_shot(project: Path, manifest: list, i: int, shot: int, asset: dict, download_from: str | None = None,
+               copy_from: Path | None = None) -> None:
+    """Save extra shot number `shot` (2 or 3) of scene i as assets/scene_XX_sN.<ext>."""
+    asset_dir = project / "assets"
+    asset_dir.mkdir(exist_ok=True)
+    source = download_from or str(copy_from)
+    suffix = Path(urlparse(source).path if download_from else source).suffix.lower()
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".webm", ".mkv", ".ogv"):
+        suffix = ".mp4" if asset["kind"] == "video" else ".jpg"
+    dest = asset_dir / f"scene_{i:02d}_s{shot}{suffix}"
+    if download_from:
+        download(download_from, dest)
+        if asset["kind"] == "image":
+            try:
+                from PIL import Image
+                with Image.open(dest) as img:
+                    img.verify()
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"The picture downloaded for scene {i + 1}, shot {shot} could not be read")
+        report_use(asset)
+    else:
+        shutil.copyfile(copy_from, dest)
+    for old in asset_dir.glob(f"scene_{i:02d}_s{shot}.*"):
+        if old != dest and not old.name.endswith(".part"):
+            old.unlink()
+    asset["path"] = str(dest)
+    shots = manifest[i].setdefault("shots", [])
+    while len(shots) < shot - 1:
+        shots.append(None)
+    shots[shot - 2] = asset
+    save_json(project / "assets.json", manifest)
+
+
+def gather_shots(project: Path, script: dict, timeline: list[dict], manifest: list, used: set) -> None:
+    """Fetch the extra shots that long scenes need (SHOT_SECONDS), from the same search as their main visual."""
+    for i, scene in enumerate(script["scenes"]):
+        want = shots_wanted(timeline[i]["duration"])
+        if want < 2 or i >= len(manifest) or not manifest[i]:
+            continue
+        if (scene.get("visual") or {}).get("source") == "ai":
+            continue   # AI scenes only get extra shots you generate and pick yourself
+        for shot in range(2, want + 1):
+            have = (manifest[i].get("shots") or [])[shot - 2:shot - 1]
+            if have and have[0] and Path(have[0].get("path", "")).exists():
+                continue
+            log(f"Scene {i + 1}: extra shot {shot} of {want}")
+            for attempt in range(3):
+                asset = find_visual(scene, used, timeline[i]["duration"] / want)
+                used.add(asset["id"])
+                try:
+                    store_shot(project, manifest, i, shot, asset, download_from=asset["url"])
+                    break
+                except (RuntimeError, requests.RequestException) as e:
+                    if attempt == 2:
+                        raise
+                    log(f"  {str(e)[:200]}; trying the next result")
 
 
 def rejected_assets(project: Path) -> set:
@@ -1292,12 +1366,14 @@ def reject_asset(project: Path, asset_id: str, rejected: bool = True) -> None:
 
 def gather_visuals(project: Path, script: dict, timeline: list[dict]) -> list[dict]:
     manifest = load_manifest(project)
-    used = {a["id"] for a in manifest if a} | rejected_assets(project)
+    used = {a["id"] for a in manifest if a} | {s["id"] for a in manifest if a for s in a.get("shots") or [] if s} \
+        | rejected_assets(project)
     for i, scene in enumerate(script["scenes"]):
         if i < len(manifest) and manifest[i] and Path(manifest[i]["path"]).exists():
             continue
         log(f"Visual {i + 1}/{len(script['scenes'])}: {scene.get('visual', {}).get('query')}")
         fetch_into(project, manifest, i, scene, used, timeline[i]["duration"])
+    gather_shots(project, script, timeline, manifest, used)
     return manifest[:len(script["scenes"])]
 
 
@@ -1352,6 +1428,8 @@ def store_asset(project: Path, manifest: list, i: int, asset: dict, download_fro
     asset["path"] = str(dest)
     while len(manifest) <= i:
         manifest.append(None)
+    if manifest[i] and manifest[i].get("shots"):   # a new main visual keeps the scene's extra shots
+        asset["shots"] = manifest[i]["shots"]
     manifest[i] = asset
     save_json(project / "assets.json", manifest)   # saved after each scene so a crash loses nothing
 
@@ -1369,29 +1447,34 @@ def refetch_visual(project: Path, script: dict, timeline: list[dict], i: int) ->
     return asset
 
 
-def use_visual(project: Path, i: int, picked: dict, manifest: list | None = None) -> dict:
-    """Use a picked result for scene i: a search result (downloaded; NASA results get their full-size image looked
-    up first) or an AI-generated file already in the project's ai/ folder."""
+def use_visual(project: Path, i: int, picked: dict, manifest: list | None = None, shot: int = 1) -> dict:
+    """Use a picked result for scene i (shot 1 = its main visual, 2 or 3 = an extra shot): a search result
+    (downloaded; NASA results get their full-size image looked up first) or an AI-generated file in ai/."""
     local = project / "ai" / picked["file"] if picked.get("file") else None
     url = None if local else picked.get("url") or (
         nasa_image_url(picked["collection"]) if picked.get("collection") else None)
     if not url and not (local and local.is_file()):
         raise RuntimeError("That result has no downloadable file; pick another one")
     manifest = load_manifest(project) if manifest is None else manifest
-    old = manifest[i] if i < len(manifest) else None
+    if shot > 1 and (i >= len(manifest) or not manifest[i]):
+        raise RuntimeError(f"Scene {i + 1} needs its main visual before extra shots")
+    current = manifest[i] if i < len(manifest) else None
+    old = current if shot == 1 else ((current.get("shots") or [])[shot - 2:shot - 1] or [None])[0]
     asset = {"kind": picked["kind"], "url": url or "", "id": picked["id"], "credit": picked.get("credit", ""),
              "query": picked.get("query", ""), "source": picked.get("source", "")}
     if picked.get("track"):
         asset["track"] = picked["track"]
+    store = store_asset if shot == 1 else (lambda *a, **kw: store_shot(a[0], a[1], a[2], shot, *a[3:], **kw))
     if local:
-        store_asset(project, manifest, i, asset, copy_from=local)
+        store(project, manifest, i, asset, copy_from=local)
     else:
-        log(f"Downloading the {asset['kind']} you picked for scene {i + 1} ({picked.get('provider', asset['source'])})")
-        store_asset(project, manifest, i, asset, download_from=url)
+        log(f"Downloading the {asset['kind']} you picked for scene {i + 1}{f', shot {shot}' if shot > 1 else ''} "
+            f"({picked.get('provider', asset['source'])})")
+        store(project, manifest, i, asset, download_from=url)
     if old and old.get("id") != asset["id"]:
         reject_asset(project, old["id"])
     reject_asset(project, asset["id"], rejected=False)
-    log(f"Scene {i + 1} now uses: {asset['credit']}")
+    log(f"Scene {i + 1}{f' (shot {shot})' if shot > 1 else ''} now uses: {asset['credit']}")
     return asset
 
 
@@ -1547,11 +1630,42 @@ def source_matrix(path) -> str:
     return "bt709" if int(info.get("height") or 1080) >= 720 else "bt601"
 
 
+def _shot_chain(asset: dict, frames: int, w: int, h: int, index: int) -> str:
+    """Filters that turn one visual into exactly `frames` frames of w x h video (an input's chain in a graph)."""
+    src = asset["path"]
+    if asset["kind"] == "image":
+        step = 0.20 / max(frames, 1)
+        z = f"1+{step:.7f}*on" if index % 2 == 0 else f"1.20-{step:.7f}*on"
+        return (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
+                f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                f":d={frames}:s={w}x{h}:fps={FPS},setsar=1,"
+                f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_BT709}")
+    return (f"scale={w}:{h}:force_original_aspect_ratio=increase:in_color_matrix={source_matrix(src)}"
+            f":out_color_matrix=bt709:out_range=tv,crop={w}:{h},fps={FPS},setsar=1,format=yuv420p,"
+            f"trim=end_frame={frames},setpts=PTS-STARTPTS,{TAG_BT709}")
+
+
 def render_scene(asset: dict, frames: int, out: Path, index: int, size: tuple[int, int] | None = None,
-                 keyframes: tuple[int, ...] | list[int] = ()) -> None:
+                 keyframes: tuple[int, ...] | list[int] = (), shots: list[dict] | None = None) -> None:
     """Render one scene's visual to exactly `frames` frames. `keyframes` are frame numbers where the
-    segment will later be cut without re-encoding (where its cross-fades start and end)."""
+    segment will later be cut without re-encoding (where its cross-fades start and end). With `shots`
+    (several visuals), the scene shows each in turn, split evenly, as one segment."""
     w, h = size or (W, H)
+    if shots and len(shots) > 1:
+        n = len(shots)
+        counts = [frames // n] * (n - 1) + [frames - frames // n * (n - 1)]
+        inputs, chains = [], []
+        for k, (shot, count) in enumerate(zip(shots, counts)):
+            inputs += (["-i", shot["path"]] if shot["kind"] == "image" else ["-stream_loop", "-1", "-i", shot["path"]])
+            chains.append(f"[{k}:v]{_shot_chain(shot, count, w, h, index + k)}[s{k}]")
+        graph = ";".join(chains) + ";" + "".join(f"[s{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0[v]"
+        cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", graph, "-map", "[v]", "-an"]
+        if keyframes:
+            cmd += ["-force_key_frames", "expr:" + "+".join(f"eq(n,{k})" for k in keyframes), "-forced-idr", "1"]
+        tmp = out.with_name(out.stem + ".part.mp4")
+        run([*cmd, "-frames:v", frames, *ENCODE, tmp])
+        tmp.replace(out)
+        return
     src = asset["path"]
     if asset["kind"] == "image":
         # Slow "Ken Burns" zoom; alternate zoom-in and zoom-out for variety.
@@ -1733,9 +1847,11 @@ def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg
     for i, (tl, asset) in enumerate(zip(timeline, assets)):
         out = seg_dir / f"seg_{i:02d}.mp4"
         want = tl["frames"] + (xf if i < n - 1 else 0)
-        src = Path(asset["path"])
+        shots = scene_shots(asset, tl["duration"])
+        sigs = [[Path(s["path"]).name, *_file_sig(Path(s["path"]))] for s in shots]
         key = {"frames": want, "keyframes": fade_cuts(i, n, tl["frames"], xf) if xf else [],
-               "asset": [src.name, *_file_sig(src)], "zoom": zoom[i] % 2, "size": list(size), "v": RENDER_VERSION}
+               "asset": sigs[0] if len(sigs) == 1 else sigs, "zoom": zoom[i] % 2, "size": list(size),
+               "v": RENDER_VERSION}
         have = index.get(out.stem) or {}
         if out.exists() and have.get("segment") == _file_sig(out) and all(have.get(k) == v for k, v in key.items()):
             continue
@@ -1751,7 +1867,8 @@ def render_segments(project: Path, timeline: list[dict], assets: list[dict], seg
         if workers > 1:
             log(f"Rendering {len(todo)} scene(s), {workers} at a time")
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(render_scene, asset, want, out, zoom[i], size, key["keyframes"]): (i, out, key)
+            futures = {pool.submit(render_scene, asset, want, out, zoom[i], size, key["keyframes"],
+                                   scene_shots(asset, timeline[i]["duration"])): (i, out, key)
                        for i, asset, want, out, key in todo}
             try:
                 for done, future in enumerate(as_completed(futures), start=1):
@@ -2262,7 +2379,8 @@ def clean_text(s: str) -> str:
 
 
 def build_description(script: dict, assets: list[dict]) -> str:
-    credits = list(dict.fromkeys(a["credit"] for a in assets if a and a.get("credit")))
+    credits = list(dict.fromkeys(v["credit"] for a in assets if a for v in [a, *(a.get("shots") or [])]
+                                 if v and v.get("credit")))
     desc = clean_text(script.get("description", "")).strip()
     if credits:
         desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
@@ -2347,7 +2465,8 @@ def upload_short(project: Path, script: dict, assets: list[dict], args) -> str:
     desc = clean_text(script.get("description", "")).strip().split("\n\n")[0]
     if (project / "youtube.json").exists():
         desc += f"\n\nFull video: {load_json(project / 'youtube.json')['url']}"
-    credits = list(dict.fromkeys(a["credit"] for a in assets[s["first"]:s["last"] + 1] if a and a.get("credit")))
+    credits = list(dict.fromkeys(v["credit"] for a in assets[s["first"]:s["last"] + 1] if a
+                                 for v in [a, *(a.get("shots") or [])] if v and v.get("credit")))
     if credits:
         desc += "\n\nVisual credits:\n" + "\n".join(f"- {clean_text(c)}" for c in credits)
     desc += "\n\nNarration uses an AI-generated voice."
@@ -2458,6 +2577,8 @@ def settings_problems() -> list[str]:
         problems.append(f"VOICE_SPEED is {VOICE_SPEED:g}; ElevenLabs accepts 0.7 to 1.2")
     if CROSSFADE < 0 or CROSSFADE > 2:
         problems.append(f"CROSSFADE is {CROSSFADE:g}; use 0 (hard cuts) up to 2 seconds")
+    if SHOT_SECONDS and not 4 <= SHOT_SECONDS <= 60:
+        problems.append(f"SHOT_SECONDS is {SHOT_SECONDS:g}; use 0 (one shot per scene) or 4 to 60 seconds")
     if AUTO_PICK not in ("off", "rank", "auto"):
         problems.append(f"AUTO_PICK is '{AUTO_PICK}'; use off, rank or auto")
     if AI_VISUALS not in ("off", "images", "images_and_video"):

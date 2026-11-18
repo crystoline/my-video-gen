@@ -499,6 +499,7 @@ function scriptTab(p) {
   const d = S.draft;
   if (!d) return h("p", { class: "muted" }, p.step === "writing" ? "Claude is writing the script. It appears here when the fact-check is done." : "No script yet.");
   return h("div", {},
+    retentionPanel(p),
     factcheckPanel(p),
     metaPanel(d),
     h("div", { class: "row between", style: "margin:1.25rem 0 .5rem" },
@@ -511,6 +512,28 @@ function scriptTab(p) {
         const m = prompt("Rewrite the whole script from scratch? Current narration clips and visuals move to the project's .trash folder.\n\nTarget length in minutes:", "6");
         if (m) startJob("rewrite", { minutes: Number(m) });
       } }, "Rewrite script from scratch")));
+}
+
+// Audience retention per scene (from YouTube Analytics, after "Refresh statistics" on the Videos page)
+function retentionPanel(p) {
+  const r = p.retention || [];
+  if (!r.length) return null;
+  const worst = r.map((x, i) => Object.assign({ i }, x)).sort((a, b) => b.drop - a.drop).slice(0, 3).filter(x => x.drop > 0);
+  return h("div", { class: "panel stack" },
+    h("h2", {}, "Where viewers leave"),
+    h("p", { class: "muted small" }, `Of the viewers who start the video, ${Math.round(r[r.length - 1].end)}% are still watching at the end. Each scene shows the share watching at its start and end. The biggest drops:`),
+    h("ol", {}, worst.map(x => h("li", {}, h("strong", {}, `Scene ${x.i + 1}`), ` loses ${x.drop.toFixed(1)} points (${Math.round(x.start)}% → ${Math.round(x.end)}%): `,
+      h("span", { class: "muted" }, `${(p.script.scenes[x.i] || {}).narration.slice(0, 120)}…`)))),
+    h("p", { class: "muted small" }, "Long, slow or off-topic scenes usually lose the most. A sharper line or a new visual there helps the next videos too."));
+}
+
+function retentionMeter(s) {
+  const r = s._orig != null && S.project.retention ? S.project.retention[s._orig] : null;
+  if (!r) return null;
+  const pct = Math.max(0, Math.min(100, r.start));
+  return h("span", { class: "retention", title: `Viewers watching: ${r.start}% at the start of this scene, ${r.end}% at its end` },
+    h("span", { class: "meter" }, h("span", { style: `width:${pct}%` })),
+    h("span", { class: "muted small" }, `${Math.round(r.start)}% → ${Math.round(r.end)}%`));
 }
 
 function totalsText() {
@@ -611,7 +634,7 @@ function sceneEditor(s, i) {
   };
   return h("div", { class: "scene" },
     h("div", { class: "head" },
-      h("span", { class: "num" }, `Scene ${i + 1}`), chipBox,
+      h("span", { class: "num" }, `Scene ${i + 1}`), chipBox, retentionMeter(s),
       info && info.audio.url ? h("audio", { controls: true, preload: "none", src: info.audio.url }) : null,
       h("div", { class: "tools" },
         state === "voiced" ? h("button", { class: "small", title: "Generate this clip again with the same text", onclick: () =>
@@ -1144,11 +1167,38 @@ function renderQueue(q) {
       h("button", { class: "small", disabled: i === topics.length - 1, onclick: () => { [topics[i + 1], topics[i]] = [topics[i], topics[i + 1]]; save(topics); } }, "↓"),
       h("button", { class: "small danger", onclick: () => { if (confirm(`Remove “${t}” from the queue?`)) save(topics.filter((_, k) => k !== i)); } }, "✕")))
       : h("p", { class: "muted" }, "The queue is empty.")),
+    ideasPanel(topics, save, () => channel),
     q.failed.length ? h("div", { class: "panel" }, h("h2", {}, "Failed topics"),
       q.failed.map(f => h("div", { class: "queue-item" }, h("span", { class: "muted small" }, f.date), h("span", { class: "t" }, f.topic, h("div", { class: "muted small" }, f.note)),
         h("button", { class: "small", onclick: async () => { try { renderQueue(await api("POST", "/api/queue/requeue", { topic: f.topic })); } catch (e) { toast(e.message, true); } } }, "Back to queue")))) : null,
     q.done.length ? h("details", { class: "panel" }, h("summary", {}, `Done (${q.done.length})`),
       q.done.map(f => h("div", { class: "queue-item" }, h("span", { class: "muted small" }, f.date), h("span", { class: "t" }, f.topic)))) : null);
+}
+
+// Claude suggests topics from the channel's description and how its videos did
+function ideasPanel(topics, save, getChannel) {
+  const box = h("div", { class: "stack" });
+  const draw = () => {
+    const ideas = S.ideas || [];
+    box.replaceChildren(...ideas.map(idea => h("div", { class: "queue-item" },
+      h("span", { class: "t" }, idea.topic, h("div", { class: "muted small" }, idea.why)),
+      topics.includes(idea.topic) ? chip("in the queue", "ok")
+        : h("button", { class: "small", onclick: () => save(topics.concat([idea.topic])) }, "Add to queue"))));
+  };
+  const button = h("button", { onclick: async () => {
+    button.disabled = true;
+    box.replaceChildren(h("span", { class: "row muted small" }, h("span", { class: "spinner" }), "Claude is looking at your videos and their results…"));
+    try {
+      const r = await api("POST", "/api/queue/ideas", { channel: getChannel(), count: 10 });
+      S.ideas = r.ideas; draw();
+    } catch (e) { toast(e.message, true); box.replaceChildren(); }
+    button.disabled = false;
+  } }, S.ideas && S.ideas.length ? "Suggest more" : "Suggest topics");
+  draw();
+  return h("div", { class: "panel stack" },
+    h("div", { class: "row between" }, h("h2", { style: "margin:0" }, "Topic ideas"), button),
+    h("p", { class: "muted small" }, "Claude suggests new topics from what the channel covers, how its uploaded videos performed (refresh statistics on the Videos page first) and what is already queued. About a cent each time."),
+    box);
 }
 
 // ---------------------------------------------------------------- settings

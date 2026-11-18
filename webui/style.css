@@ -12,6 +12,8 @@
   --chip: #eef1f5;
   --code: #f0f2f5;
   --radius: 10px;
+  --meter-fill: #2a78d6;
+  --meter-track: #cde2fb;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -27,6 +29,8 @@
     --bad: #ef6b5e;
     --chip: #262b33;
     --code: #181b20;
+    --meter-fill: #3987e5;
+    --meter-track: #184f95;
   }
 }
 * { box-sizing: border-box; }
@@ -134,6 +138,9 @@ label > span { display: block; font-size: .85rem; color: var(--muted); margin-bo
 .vcard .narr { font-size: .85rem; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 
 .warn-text { color: var(--warn); }
+.retention { display: inline-flex; align-items: center; gap: .35rem; }
+.meter { display: inline-block; width: 70px; height: 8px; border-radius: 4px; background: var(--meter-track); overflow: hidden; }
+.meter > span { display: block; height: 100%; border-radius: 4px; background: var(--meter-fill); }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { border: 0; border-radius: 0; padding: .3rem .8rem; font-size: .88rem; }
 .seg button + button { border-left: 1px solid var(--line); }

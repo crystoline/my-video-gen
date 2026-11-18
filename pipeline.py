@@ -2840,9 +2840,79 @@ def iso_seconds(value) -> int | None:
     return ((d * 24 + h) * 60 + mi) * 60 + s
 
 
-def youtube_stats(video_ids: list[str]) -> tuple[dict, list[str]]:
+def retention_curve(analytics, video_id: str) -> list[list[float]]:
+    """Audience retention: [[share of the video elapsed (0-1), share of viewers still watching], ...]."""
+    resp = analytics.reports().query(
+        ids="channel==MINE", startDate="2005-02-14", endDate=datetime.now().strftime("%Y-%m-%d"),
+        metrics="audienceWatchRatio", dimensions="elapsedVideoTimeRatio", filters=f"video=={video_id}",
+        sort="elapsedVideoTimeRatio").execute()
+    cols = [c["name"] for c in resp.get("columnHeaders", [])]
+    rows = [dict(zip(cols, row)) for row in resp.get("rows") or []]
+    return [[float(r["elapsedVideoTimeRatio"]), float(r["audienceWatchRatio"])] for r in rows]
+
+
+def scene_retention(timeline: list[dict], curve: list) -> list[dict]:
+    """For each scene, the share of viewers still watching when it starts and when it ends (percent)."""
+    points = sorted((float(p[0]), float(p[1])) for p in curve or [])
+    total = sum(t["duration"] for t in timeline)
+    if not points or not total:
+        return []
+
+    def at(x: float) -> float:
+        if x <= points[0][0]:
+            return points[0][1]
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            if x0 <= x <= x1:
+                return y0 + (y1 - y0) * ((x - x0) / (x1 - x0) if x1 > x0 else 0)
+        return points[-1][1]
+
+    out, t = [], 0.0
+    for tl in timeline:
+        start, end = at(t / total) * 100, at((t + tl["duration"]) / total) * 100
+        out.append({"start": round(start, 1), "end": round(end, 1), "drop": round(start - end, 1)})
+        t += tl["duration"]
+    return out
+
+
+class TopicIdea(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    topic: str = Field(description="The video topic, phrased like the channel's existing topics")
+    why: str = Field(description="One short sentence: why it is likely to do well")
+
+
+class TopicIdeas(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ideas: List[TopicIdea]
+
+
+def suggest_topics(channel: dict, videos: list[dict], queued: list[str], count: int = 10) -> list[dict]:
+    """New topic ideas, based on what the channel covers, how its videos performed and what is queued."""
+    lines = []
+    for v in videos:
+        st = v.get("stats") or {}
+        perf = (f"{st['views']:,} views" if st.get("views") is not None else "not uploaded yet")
+        if st.get("avg_view_percent") is not None:
+            perf += f", viewers watch {st['avg_view_percent']:.0f}% on average"
+        lines.append(f"- {v['title']} ({perf})")
+    prompt = f"""Our YouTube channel is about {channel['about']}.
+
+Our videos so far, best performing first:
+{chr(10).join(lines) or '- none yet'}
+
+Topics already waiting in our queue:
+{chr(10).join(f'- {t}' for t in queued) or '- none'}
+
+Suggest {count} new video topics most likely to do well for this channel. Lean towards the themes and question styles of our best performers, mixed with a few fresh angles. Phrase each like our existing topics (often a curious question). Do not repeat our videos or queued topics. Accuracy matters: no topics built on myths or clickbait."""
+    ideas = claude_json(ANTHROPIC_MODEL, f"You plan content for a YouTube channel about {channel['about']}.",
+                        prompt, TopicIdeas, max_tokens=4000).ideas
+    seen = {t.lower() for t in queued} | {v["title"].lower() for v in videos}
+    return [i.model_dump() for i in ideas if i.topic.strip() and i.topic.lower() not in seen][:count]
+
+
+def youtube_stats(video_ids: list[str], retention_for: list[str] | tuple = ()) -> tuple[dict, list[str]]:
     """Views, likes and comments (YouTube Data API) plus watch time and average view duration (YouTube
-    Analytics API, which lags a day or two) for your uploads. Returns ({video id: stats}, notes)."""
+    Analytics API, which lags a day or two) for your uploads, and the audience-retention curve for the videos
+    in `retention_for`. Returns ({video id: stats}, notes)."""
     from googleapiclient.discovery import build
     creds = youtube_credentials(interactive=False)
     youtube = build("youtube", "v3", credentials=creds)
@@ -2881,6 +2951,14 @@ def youtube_stats(video_ids: list[str]) -> tuple[dict, list[str]]:
     except Exception as e:   # usually: the YouTube Analytics API is not enabled in the Google Cloud project
         notes.append(f"Watch time is unavailable ({str(e)[:200]}). Enable the YouTube Analytics API in your "
                      "Google Cloud project (next to the YouTube Data API v3).")
+        return out, notes
+    for vid in retention_for:
+        try:
+            curve = retention_curve(analytics, vid)
+            if curve:
+                out.setdefault(vid, {})["retention"] = curve
+        except Exception as e:   # new or little-watched videos have no retention data yet
+            notes.append(f"No audience retention for {vid} yet ({str(e)[:120]})")
     return out, notes
 
 

@@ -108,7 +108,8 @@ def test_refreshing_statistics_saves_them_per_video(client, fakes, monkeypatch):
     pl.save_json(P / "youtube.json", {"video_id": "MAIN", "url": "https://youtu.be/MAIN"})
     (P / "short").mkdir()
     pl.save_json(P / "short" / "youtube.json", {"video_id": "SHORT", "url": "https://youtube.com/shorts/SHORT"})
-    monkeypatch.setattr(pl, "youtube_stats", lambda ids: ({
+    asked = {}
+    monkeypatch.setattr(pl, "youtube_stats", lambda ids, retention_for=(): asked.update(retention=list(retention_for)) or ({
         "MAIN": {"views": 1200, "minutes_watched": 900.0}, "SHORT": {"views": 5000}}, ["a note"]))
     r = client.post("/api/stats/refresh", headers=H)
     assert r.status_code == 200
@@ -116,6 +117,7 @@ def test_refreshing_statistics_saves_them_per_video(client, fakes, monkeypatch):
     assert any("a note" in line for line in j["lines"])
     saved = pl.load_json(P / "stats.json")
     assert saved["video"]["views"] == 1200 and saved["short"]["views"] == 5000 and saved["fetched"]
+    assert "MAIN" in asked["retention"] and "SHORT" not in asked["retention"]   # retention for full videos only
     listed = {x["slug"]: x for x in client.get("/api/projects").get_json()}[slug]
     assert listed["stats"]["video"]["minutes_watched"] == 900.0
     assert listed["short_youtube"]["video_id"] == "SHORT"

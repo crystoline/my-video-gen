@@ -286,6 +286,8 @@ def project_state(slug: str, detail: bool = False) -> dict:
                          "uploaded": (youtube or {}).get("translations") or {}},
         "translation_of": meta.get("translation_of"),
         "dubs": dubs_of(slug),
+        "retention": pl.scene_retention(scene_tl, ((state["stats"] or {}).get("video") or {}).get("retention"))
+        if state.get("stats") and script else [],
         "music": {"choice": meta.get("music"), "auto": bool(meta.get("music_auto")),
                   "track": track.name if track else None, "default": pl.describe_default_music()},
         "script": script, "factcheck": pl.load_json(check_path) if check_path.exists() else None,
@@ -537,7 +539,7 @@ def job_stats() -> None:
         pl.log("Nothing has been uploaded yet, so there are no statistics to fetch")
         return
     pl.log(f"Fetching statistics for {len(uploads)} upload(s)")
-    stats, notes = pl.youtube_stats(list(uploads))
+    stats, notes = pl.youtube_stats(list(uploads), [vid for vid, (_, kind) in uploads.items() if kind == "video"])
     for note in notes:
         pl.log(note)
     per_project: dict[str, dict] = {}
@@ -1209,6 +1211,25 @@ def api_save_queue():
             clean.append(t)
     write_queue(comments, clean)
     return api_queue()
+
+
+@app.post("/api/queue/ideas")
+def api_topic_ideas():
+    """Claude suggests new topics from the channel's description, its videos' performance and the queue."""
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        abort(409, "ANTHROPIC_API_KEY is not set")
+    data = body()
+    channel = pl.get_channel(channel_id(data))
+    default = pl.load_channels()["default"]
+    videos = []
+    for v in list_projects():
+        if (v.get("channel") or {}).get("id", default) != channel["id"]:
+            continue
+        videos.append({"title": v["title"], "stats": (v.get("stats") or {}).get("video")})
+    videos.sort(key=lambda v: -((v["stats"] or {}).get("views") or 0))
+    _, queued = read_queue()
+    ideas = pl.suggest_topics(channel, videos[:40], queued, min(max(int(data.get("count") or 10), 1), 20))
+    return jsonify({"ideas": ideas, "channel": channel["name"]})
 
 
 @app.post("/api/queue/requeue")

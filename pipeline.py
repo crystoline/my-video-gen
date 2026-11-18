@@ -32,6 +32,8 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +85,7 @@ def configure() -> None:
     global ELEVENLABS_MODEL, VOICE_STABILITY, VOICE_SIMILARITY, VOICE_STYLE, VOICE_SPEAKER_BOOST, VOICE_SPEED
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
     global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
+    global FAL_KEY, AI_VISUALS, AI_IMAGE_MODEL, AI_VIDEO_MODEL, AI_IMAGE_COST, AI_VIDEO_COST
     global RENDER_JOBS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
@@ -108,6 +111,13 @@ def configure() -> None:
     # Claude looks at the search results' previews: off, rank (in the picker) or auto (also automatic fetches)
     AUTO_PICK = (os.getenv("AUTO_PICK") or "off").strip().lower()
     VISION_MODEL = os.getenv("ANTHROPIC_VISION_MODEL") or ANTHROPIC_MODEL
+    # AI-generated visuals through fal.ai: off, images, or images_and_video
+    FAL_KEY = os.getenv("FAL_KEY", "")
+    AI_VISUALS = (os.getenv("AI_VISUALS") or "off").strip().lower()
+    AI_IMAGE_MODEL = (os.getenv("AI_IMAGE_MODEL") or "fal-ai/flux/dev").strip()
+    AI_VIDEO_MODEL = (os.getenv("AI_VIDEO_MODEL") or "fal-ai/kling-video/v2.5-turbo/pro/text-to-video").strip()
+    AI_IMAGE_COST = float(os.getenv("AI_IMAGE_COST") or 0.025)   # USD per image, shown before generating
+    AI_VIDEO_COST = float(os.getenv("AI_VIDEO_COST") or 0.35)    # USD per 5-second clip
     MUSIC_PATH = _path("MUSIC_PATH", "") if os.getenv("MUSIC_PATH") else None
     MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
     MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
@@ -1292,7 +1302,14 @@ def gather_visuals(project: Path, script: dict, timeline: list[dict]) -> list[di
 
 
 def fetch_into(project: Path, manifest: list, i: int, scene: dict, used: set, min_seconds: float) -> dict:
-    """Find and download a visual for scene i, moving on to the next result if a download is broken."""
+    """Find and download a visual for scene i, moving on to the next result if a download is broken.
+    Scenes set to "ai" get a newly generated image when AI visuals are on, and a stock photo otherwise."""
+    if (scene.get("visual") or {}).get("source") == "ai":
+        if ai_enabled():
+            item = generate_ai_visual(project, ai_prompt(scene), "image", 1)[0]
+            return use_visual(project, i, item, manifest=manifest)
+        log(f"  Scene {i + 1} is set to an AI image, but AI visuals are off in Settings; using a stock photo")
+        scene = dict(scene, visual=dict(scene["visual"], source="stock_photo"))
     for attempt in range(3):
         asset = find_visual(scene, used, min_seconds)
         used.add(asset["id"])
@@ -1352,24 +1369,136 @@ def refetch_visual(project: Path, script: dict, timeline: list[dict], i: int) ->
     return asset
 
 
-def use_visual(project: Path, i: int, picked: dict) -> dict:
-    """Use a search result picked in the web UI for scene i. NASA results get their full-size image looked up first."""
-    url = picked.get("url") or (nasa_image_url(picked["collection"]) if picked.get("collection") else None)
-    if not url:
+def use_visual(project: Path, i: int, picked: dict, manifest: list | None = None) -> dict:
+    """Use a picked result for scene i: a search result (downloaded; NASA results get their full-size image looked
+    up first) or an AI-generated file already in the project's ai/ folder."""
+    local = project / "ai" / picked["file"] if picked.get("file") else None
+    url = None if local else picked.get("url") or (
+        nasa_image_url(picked["collection"]) if picked.get("collection") else None)
+    if not url and not (local and local.is_file()):
         raise RuntimeError("That result has no downloadable file; pick another one")
-    manifest = load_manifest(project)
+    manifest = load_manifest(project) if manifest is None else manifest
     old = manifest[i] if i < len(manifest) else None
-    asset = {"kind": picked["kind"], "url": url, "id": picked["id"], "credit": picked.get("credit", ""),
+    asset = {"kind": picked["kind"], "url": url or "", "id": picked["id"], "credit": picked.get("credit", ""),
              "query": picked.get("query", ""), "source": picked.get("source", "")}
     if picked.get("track"):
         asset["track"] = picked["track"]
-    log(f"Downloading the {asset['kind']} you picked for scene {i + 1} ({picked.get('provider', asset['source'])})")
-    store_asset(project, manifest, i, asset, download_from=url)
+    if local:
+        store_asset(project, manifest, i, asset, copy_from=local)
+    else:
+        log(f"Downloading the {asset['kind']} you picked for scene {i + 1} ({picked.get('provider', asset['source'])})")
+        store_asset(project, manifest, i, asset, download_from=url)
     if old and old.get("id") != asset["id"]:
         reject_asset(project, old["id"])
     reject_asset(project, asset["id"], rejected=False)
     log(f"Scene {i + 1} now uses: {asset['credit']}")
     return asset
+
+
+# ----------------------------------------------------------------------------
+# AI-generated visuals (fal.ai). Generated files are kept in the project's ai/ folder, so each one is paid once
+# and can be picked (again) later.
+# ----------------------------------------------------------------------------
+AI_STYLE = " Photorealistic, cinematic documentary style, natural lighting, no text, no watermark."
+
+
+def ai_enabled(kind: str = "image") -> bool:
+    if not FAL_KEY or AI_VISUALS == "off":
+        return False
+    return kind == "image" or AI_VISUALS == "images_and_video"
+
+
+def ai_prompt(scene: dict) -> str:
+    """A prompt from the scene's visual search words (the narration adds context)."""
+    query = ((scene.get("visual") or {}).get("query") or "").strip()
+    return f"{query or scene.get('narration', '')[:200]}.{AI_STYLE}"
+
+
+def fal_run(model: str, arguments: dict, timeout: float = 900) -> dict:
+    """Run a fal.ai model through its queue and return its result."""
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is not set in .env (get a key at fal.ai)")
+    headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+    # A plain POST, not the retrying session: a retried submission could be generated (and billed) twice
+    r = requests.post(f"https://queue.fal.run/{model}", headers=headers, json=arguments, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"fal.ai refused the request ({r.status_code}): {r.text[:300]}")
+    submitted = r.json()
+    status_url, response_url = submitted["status_url"], submitted["response_url"]
+    end, last = time.time() + timeout, None
+    while True:
+        s = HTTP.get(status_url, headers=headers, timeout=30).json()
+        state = s.get("status")
+        if state == "COMPLETED":
+            if s.get("error"):
+                raise RuntimeError(f"fal.ai could not generate it: {s['error']}")
+            break
+        if state != last:
+            pos = f" (position {s['queue_position']})" if s.get("queue_position") is not None else ""
+            log(f"  fal.ai: {str(state).lower().replace('_', ' ')}{pos}")
+            last = state
+        if time.time() > end:
+            raise RuntimeError(f"fal.ai did not finish within {timeout / 60:.0f} minutes")
+        time.sleep(2)
+    res = HTTP.get(response_url, headers=headers, timeout=60)
+    if res.status_code >= 400:
+        raise RuntimeError(f"fal.ai result error {res.status_code}: {res.text[:300]}")
+    return res.json()
+
+
+def ai_items(project: Path) -> list[dict]:
+    path = project / "ai" / "index.json"
+    return load_json(path) if path.exists() else []
+
+
+def generate_ai_visual(project: Path, prompt: str, kind: str = "image", count: int = 1) -> list[dict]:
+    """Generate images (or one video clip) for a project and keep them in ai/. Returns the new items."""
+    if not ai_enabled(kind):
+        raise RuntimeError("AI video clips are switched off in Settings" if kind == "video" and ai_enabled()
+                           else "AI visuals are switched off in Settings, or FAL_KEY is not set in .env")
+    prompt = " ".join(prompt.split())[:1500]
+    if kind == "image":
+        model, args = AI_IMAGE_MODEL, {"prompt": prompt, "image_size": "landscape_16_9", "num_images": count}
+        log(f"Generating {count} AI image(s) with {model} (about ${AI_IMAGE_COST * count:.2f})")
+    else:
+        model, args = AI_VIDEO_MODEL, {"prompt": prompt, "aspect_ratio": "16:9", "duration": "5"}
+        log(f"Generating a 5-second AI video clip with {model} (about ${AI_VIDEO_COST:.2f}); this can take minutes")
+    result = fal_run(model, args)
+    urls = [im["url"] for im in result.get("images") or [] if im.get("url")] if kind == "image" else \
+        [(result.get("video") or {}).get("url")]
+    folder = project / "ai"
+    folder.mkdir(parents=True, exist_ok=True)
+    items, new = ai_items(project), []
+    for url in filter(None, urls):
+        gid = uuid.uuid4().hex[:10]
+        suffix = Path(urlparse(url).path).suffix.lower()
+        suffix = suffix if suffix in ((".jpg", ".jpeg", ".png", ".webp") if kind == "image" else (".mp4", ".webm", ".mov")) \
+            else (".jpg" if kind == "image" else ".mp4")
+        dest = folder / f"{gid}{suffix}"
+        download(url, dest)
+        thumb = dest.name
+        if kind == "video":
+            try:
+                run(["ffmpeg", "-y", "-ss", "1", "-i", dest, "-frames:v", "1", "-vf", "scale=640:-2", folder / f"{gid}.jpg"])
+                thumb = f"{gid}.jpg"
+            except RuntimeError:
+                thumb = None
+        item = {"id": f"ai:{gid}", "kind": kind, "file": dest.name, "thumb": thumb, "prompt": prompt, "model": model,
+                "created": datetime.now().isoformat(timespec="seconds"), "source": "ai", "provider": "AI (fal.ai)",
+                "credit": f"AI-generated {kind} ({model} via fal.ai)", **({"duration": 5} if kind == "video" else {})}
+        items.append(item)
+        new.append(item)
+    if not new:
+        raise RuntimeError("fal.ai returned no file")
+    save_json(folder / "index.json", items)
+    log(f"Generated {len(new)} AI {kind}(s); they are kept in the project's ai folder")
+    return new
+
+
+def uses_ai(assets: list) -> bool:
+    """Whether any scene shows an AI-generated visual (YouTube's synthetic-content box must be ticked then)."""
+    return any(a and (a.get("source") == "ai" or any(s.get("source") == "ai" for s in a.get("shots") or []))
+               for a in assets)
 
 
 def set_custom_visual(project: Path, i: int, path: Path, credit: str = "") -> dict:
@@ -2151,9 +2280,9 @@ def trim_tags(tags: list[str], limit: int = 450) -> list[str]:
     return out
 
 
-def upload_status(args) -> dict:
-    status = {"privacyStatus": args.privacy, "selfDeclaredMadeForKids": False,
-              "containsSyntheticMedia": bool(args.synthetic)}
+def upload_status(args, assets: list | None = None) -> dict:
+    synthetic = bool(args.synthetic) or uses_ai(assets or [])   # AI visuals are always disclosed
+    status = {"privacyStatus": args.privacy, "selfDeclaredMadeForKids": False, "containsSyntheticMedia": synthetic}
     if args.publish_at:
         status["privacyStatus"] = "private"  # required by YouTube for scheduled videos
         status["publishAt"] = args.publish_at
@@ -2184,7 +2313,7 @@ def upload(project: Path, script: dict, assets: list[dict], args) -> str:
             "defaultLanguage": "en",
             "defaultAudioLanguage": "en",
         },
-        "status": upload_status(args),
+        "status": upload_status(args, assets),
     }
     log("Uploading to YouTube...")
     video_id = upload_file(youtube, project / "final.mp4", body)
@@ -2225,7 +2354,7 @@ def upload_short(project: Path, script: dict, assets: list[dict], args) -> str:
     body = {"snippet": {"title": title, "description": desc[:4900],
                         "tags": trim_tags(list(script.get("tags", [])) + ["Shorts"]), "categoryId": "28",
                         "defaultLanguage": "en", "defaultAudioLanguage": "en"},
-            "status": upload_status(args)}
+            "status": upload_status(args, assets[s["first"]:s["last"] + 1])}
     log("Uploading the Short to YouTube...")
     video_id = upload_file(youtube, project / "short" / "short.mp4", body)
     log(f"Uploaded: https://youtube.com/shorts/{video_id}")
@@ -2331,6 +2460,13 @@ def settings_problems() -> list[str]:
         problems.append(f"CROSSFADE is {CROSSFADE:g}; use 0 (hard cuts) up to 2 seconds")
     if AUTO_PICK not in ("off", "rank", "auto"):
         problems.append(f"AUTO_PICK is '{AUTO_PICK}'; use off, rank or auto")
+    if AI_VISUALS not in ("off", "images", "images_and_video"):
+        problems.append(f"AI_VISUALS is '{AI_VISUALS}'; use off, images or images_and_video")
+    if AI_IMAGE_COST < 0 or AI_VIDEO_COST < 0:
+        problems.append("AI_IMAGE_COST and AI_VIDEO_COST cannot be negative")
+    for name, model in (("AI_IMAGE_MODEL", AI_IMAGE_MODEL), ("AI_VIDEO_MODEL", AI_VIDEO_MODEL)):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{2,120}", model):
+            problems.append(f"{name} '{model}' does not look like a fal.ai model id (e.g. fal-ai/flux/dev)")
     unknown = [p for p in VISUAL_PROVIDERS if p not in PROVIDERS]
     if unknown:
         problems.append(f"VISUAL_PROVIDERS has unknown names ({', '.join(unknown)}); use: {', '.join(PROVIDERS)}")

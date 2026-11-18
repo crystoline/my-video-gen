@@ -456,7 +456,7 @@ function nextStep(p) {
           `Generate voiceover (${p.voice_todo_chars} characters)`));
     case "visuals":
       return box("", `${p.visuals_ready} of ${p.scenes} scenes have a visual.`,
-        h("button", { class: "primary", onclick: () => startJob("visuals") }, "Fetch visuals"));
+        h("button", { class: "primary", onclick: () => fetchVisuals(p) }, "Fetch visuals"));
     case "render":
       return box("", p.video === "missing" ? "Everything is ready to render." : "The video is out of date with your latest changes.",
         h("button", { class: "primary", onclick: () => startJob("render") }, "Render video"));
@@ -612,6 +612,17 @@ function sceneEditor(s, i) {
 }
 
 // ---------------------------------------------------------------- visuals tab
+function aiActive() { return S.status && S.status.keys.fal && S.status.settings.AI_VISUALS !== "off"; }
+
+// "Fetch visuals", with a cost question when scenes set to AI-generated will be generated
+function fetchVisuals(p) {
+  const d = S.draft;
+  const ai = d ? d.scenes.filter(s => s.visual.source === "ai" && !(s._orig != null && p.scene_info[s._orig] && p.scene_info[s._orig].asset)).length : 0;
+  if (ai && aiActive()) {
+    startJob("visuals", null, `${ai} scene(s) are set to AI-generated and will each get a new AI image (about $${(ai * S.status.settings.AI_IMAGE_COST).toFixed(2)} in total). Continue?`);
+  } else startJob("visuals");
+}
+
 function visualsTab(p) {
   const d = S.draft;
   if (!d) return h("p", { class: "muted" }, "No script yet.");
@@ -621,7 +632,7 @@ function visualsTab(p) {
     h("div", { class: "panel row between" },
       h("div", {}, h("strong", {}, `${p.visuals_ready} of ${p.scenes} scenes have a visual. `),
         h("span", { class: "muted small" }, providers.length ? `Stock footage from ${providers.join(" and ")}.` : "No stock footage key is set, so every scene uses NASA images.")),
-      missing ? h("button", { class: "primary", onclick: () => startJob("visuals") }, `Fetch ${missing} missing visual(s)`) : null),
+      missing ? h("button", { class: "primary", onclick: () => fetchVisuals(p) }, `Fetch ${missing} missing visual(s)`) : null),
     S.dirty ? h("div", { class: "panel callout warn" }, "You have unsaved changes. Saving happens automatically when you search for or upload a visual.") : null,
     h("div", { class: "vgrid" }, d.scenes.map((s, i) => visualCard(s, i))));
 }
@@ -652,7 +663,8 @@ function visualCard(s, i) {
   return h("div", { class: "vcard" }, media,
     h("div", { class: "body" },
       h("div", { class: "row between" }, h("strong", {}, `Scene ${i + 1}`),
-        h("span", {}, a ? chip(a.source === "custom" ? "your file" : a.kind) : null, isThumb ? chip("thumbnail", "accent") : null)),
+        h("span", {}, a ? chip(a.source === "custom" ? "your file" : a.source === "ai" ? `AI ${a.kind}` : a.kind, a.source === "ai" ? "warn" : "") : null,
+          isThumb ? chip("thumbnail", "accent") : null)),
       h("div", { class: "narr" }, s.narration),
       a && a.credit ? h("div", { class: "muted small" }, a.credit) : null,
       h("div", { class: "row" },
@@ -663,7 +675,9 @@ function visualCard(s, i) {
         h("button", { class: "small primary", title: "Browse search results with previews and pick one",
           onclick: () => openPicker(i) }, "Choose…"),
         h("button", { class: "small", title: "Search with the words above and swap in the next result you have not skipped",
-          onclick: () => startJob("find_visual", { scene: i }) }, a ? "Next result" : "Find visual"),
+          onclick: () => s.visual.source === "ai" && aiActive()
+            ? startJob("find_visual", { scene: i }, `Generate a new AI image for scene ${i + 1} (about $${S.status.settings.AI_IMAGE_COST.toFixed(2)})?`)
+            : startJob("find_visual", { scene: i }) }, s.visual.source === "ai" && aiActive() ? "New AI image" : a ? "Next result" : "Find visual"),
         h("button", { class: "small", onclick: () => file.click() }, "Upload my own"), file,
         a ? h("button", { class: "small", disabled: isThumb, onclick: () => {
           d._thumbScene = s; markDirty(); renderProject();
@@ -684,6 +698,36 @@ async function openPicker(i) {
   const overlay = h("div", { class: "modal-back", onclick: e => { if (e.target === overlay) close(); } });
   const onKey = e => { if (e.key === "Escape") close(); };
   function close() { closed = true; overlay.remove(); document.removeEventListener("keydown", onKey); }
+
+  // AI generation (source "AI-generated"): a prompt, then generated items appear in the grid to pick from
+  const st = S.status.settings;
+  const aiPrompt = h("textarea", { rows: 3, placeholder: "Describe the picture, e.g. a lava river flowing into the ocean at night" });
+  const aiKind = h("select", {}, h("option", { value: "image" }, "Image"),
+    st.AI_VISUALS === "images_and_video" ? h("option", { value: "video" }, "5-second video clip") : null);
+  const aiCount = h("select", {}, [1, 2, 3, 4].map(n => h("option", { value: n, selected: n === 2 ? true : null }, `${n}`)));
+  const aiCost = () => aiKind.value === "video" ? st.AI_VIDEO_COST : st.AI_IMAGE_COST * Number(aiCount.value);
+  const aiButton = h("button", { class: "primary", type: "button", onclick: async () => {
+    if (!aiPrompt.value.trim()) { toast("Describe what the AI should make", true); return; }
+    const what = aiKind.value === "video" ? "a 5-second video clip" : `${aiCount.value} image(s)`;
+    if (!confirm(`Generate ${what} with fal.ai for about $${aiCost().toFixed(2)}?`)) return;
+    try {
+      const job = await api("POST", `/api/projects/${encodeURIComponent(slug)}/jobs`,
+        { action: "generate_visual", scene: i, prompt: aiPrompt.value, kind: aiKind.value, count: Number(aiCount.value) });
+      aiButton.disabled = true;
+      status.replaceChildren(h("span", { class: "row" }, h("span", { class: "spinner" }), "Generating… (images take seconds, video clips minutes)"));
+      follow(job, null, j => { aiButton.disabled = false; if (!closed && j.status === "done") search(1); else if (!closed) status.textContent = j.error || ""; });
+    } catch (e) { toast(e.message, true); }
+  } }, "Generate");
+  aiKind.addEventListener("change", () => { aiCount.disabled = aiKind.value === "video"; });
+  const aiOn = st.AI_VISUALS !== "off" && S.status.keys.fal;
+  const aiBox = h("div", { class: "stack", hidden: true },
+    aiOn ? h("div", { class: "stack" },
+      h("label", {}, h("span", {}, "What should the AI make? (Everything generated is kept in this video's ai folder, so you can pick it again later.)"), aiPrompt),
+      h("div", { class: "row" }, aiKind, h("label", { class: "row" }, h("span", { class: "muted small", style: "margin:0" }, "How many"), aiCount), aiButton,
+        h("span", { class: "muted small" }, "AI visuals are disclosed to YouTube automatically when the video is uploaded.")))
+      : h("div", { class: "callout warn panel" }, S.status.keys.fal ? "AI visuals are switched off. Turn them on in Settings." : "Add FAL_KEY (from fal.ai) to .env and turn AI visuals on in Settings to generate images here."));
+  const showAi = () => { aiBox.hidden = src.value !== "ai"; q.hidden = src.value === "ai"; };
+  src.addEventListener("change", () => { showAi(); search(1); });
 
   const claudeNote = h("div", { class: "small" });
   const cards = new Map();   // result id -> card element
@@ -716,6 +760,12 @@ async function openPicker(i) {
       r.results.forEach(c => { const el = card(c); cards.set(c.id, el); grid.append(el); });
       lastIds = r.results.map(c => c.id).slice(0, 12);
       const shown = grid.children.length;
+      if (src.value === "ai") {
+        if (!aiPrompt.value) aiPrompt.value = r.ai_prompt || "";
+        status.replaceChildren(shown ? `${shown} generated so far. Click one to use it for scene ${i + 1}.` : "Nothing generated for this video yet.");
+        more.hidden = true;
+        return;
+      }
       const notes = [];
       if ((src.value === "stock_video" || src.value === "stock_photo") && !r.stock_providers.length) notes.push("No stock footage key is set, so stock searches only use the free archives (see the README).");
       notes.push(...r.errors);
@@ -765,10 +815,11 @@ async function openPicker(i) {
       h("button", { class: "small", onclick: close }, "Close")),
     h("div", { class: "narr muted small" }, s.narration),
     h("form", { class: "row", onsubmit: e => { e.preventDefault(); search(1); } },
-      src, q, h("button", { class: "primary", type: "submit" }, "Search")),
-    status, claudeNote, grid, h("div", { class: "row", style: "justify-content:center" }, more)));
+      src, q, h("button", { type: "submit" }, src.value === "ai" ? "Refresh" : "Search")),
+    aiBox, status, claudeNote, grid, h("div", { class: "row", style: "justify-content:center" }, more)));
   document.body.append(overlay);
   document.addEventListener("keydown", onKey);
+  showAi();
   q.focus();
   search(1);
 }
@@ -1056,6 +1107,7 @@ function renderSettings(voiced) {
     h("div", { class: "panel stack" }, h("h2", {}, "Video"),
       h("label", {}, h("span", {}, "Cross-fade between scenes in seconds (0 = hard cuts)"), num("CROSSFADE", 0, 2, 0.1))),
     providersPanel(vals),
+    aiPanel(vals),
     h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => { if (await save()) renderSettings(voiced); } }, "Save settings")),
     statusPanel(st));
 }
@@ -1088,6 +1140,25 @@ function providersPanel(vals) {
     h("label", { class: "row" }, h("input", { type: "checkbox", checked: vals.ALLOW_SHARE_ALIKE, onchange: e => { vals.ALLOW_SHARE_ALIKE = e.target.checked; } }),
       h("span", { style: "margin:0" }, "Also use CC BY-SA (share-alike) images and footage from Wikimedia Commons and Openverse. ",
         h("span", { class: "muted small" }, "Many more results, but share-alike can require your video to carry the same licence. Public domain, CC0 and CC BY are always allowed; everything is credited in the description."))));
+}
+
+function aiPanel(vals) {
+  const keyed = S.status.keys.fal;
+  const text = (key, width) => h("input", { value: vals[key], style: `width:${width || "100%"}`, oninput: e => { vals[key] = e.target.value; } });
+  const money = key => h("input", { type: "number", min: 0, step: 0.005, value: vals[key], style: "width:7rem", oninput: e => { vals[key] = Number(e.target.value); } });
+  return h("div", { class: "panel stack" }, h("h2", {}, "AI-generated visuals (fal.ai)"),
+    keyed ? null : h("div", { class: "callout warn panel" }, "Add FAL_KEY to .env (get a key at fal.ai) and restart the web UI to use AI visuals."),
+    h("label", {}, h("span", {}, "AI visuals"),
+      h("select", { onchange: e => { vals.AI_VISUALS = e.target.value; } },
+        [["off", "Off"], ["images", "Images only"], ["images_and_video", "Images and short video clips"]]
+          .map(([k, label]) => h("option", { value: k, selected: vals.AI_VISUALS === k ? true : null }, label)))),
+    h("div", { class: "field-grid" },
+      h("label", {}, h("span", {}, "Image model (fal.ai model id)"), text("AI_IMAGE_MODEL")),
+      h("label", {}, h("span", {}, "Price per image, USD (shown before generating)"), money("AI_IMAGE_COST")),
+      h("label", {}, h("span", {}, "Video model (fal.ai model id)"), text("AI_VIDEO_MODEL")),
+      h("label", {}, h("span", {}, "Price per 5-second clip, USD"), money("AI_VIDEO_COST"))),
+    h("p", { class: "muted small" }, "Generate visuals from the picker's “AI-generated” source, or set a scene's source to AI-generated so “Fetch visuals” makes an image for it (never a video). ",
+      "Every generation asks first and shows its price; check fal.ai's pricing page if you change models. Videos with AI visuals are always marked as containing synthetic media when uploaded."));
 }
 
 function musicLibraryPanel(voiced) {

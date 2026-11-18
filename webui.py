@@ -531,6 +531,10 @@ def job_find_visual(slug: str, scene: int) -> None:
     pl.refetch_visual(p, script, timeline_for(p, script), scene)
 
 
+def job_generate_visual(slug: str, prompt: str, kind: str, count: int) -> None:
+    pl.generate_ai_visual(pl.PROJECTS_DIR / slug, prompt, kind, count)
+
+
 def job_pick_visual(slug: str, scene: int, candidate: dict, query: str) -> None:
     p = pl.PROJECTS_DIR / slug
     script = need_script(p)
@@ -821,9 +825,23 @@ def api_start_job(slug):
     elif action == "find_visual":
         i = scene_index()
         job = enqueue(slug, action, f"Find another visual for scene {i + 1}", job_find_visual, slug=slug, scene=i)
+    elif action == "generate_visual":
+        i = scene_index()
+        kind = data.get("kind", "image")
+        if kind not in ("image", "video") or not pl.ai_enabled(kind):
+            raise ValueError("AI videos are switched off in Settings" if kind == "video" and pl.ai_enabled()
+                             else "AI visuals are switched off in Settings, or FAL_KEY is not in .env")
+        prompt = " ".join(str(data.get("prompt") or "").split())[:1500]
+        if not prompt:
+            raise ValueError("Describe what the AI should make")
+        count = 1 if kind == "video" else min(max(int(data.get("count") or 1), 1), 4)
+        job = enqueue(slug, action, f"Generate AI {kind}{'s' if count > 1 else ''} for scene {i + 1}",
+                      job_generate_visual, slug=slug, prompt=prompt, kind=kind, count=count)
     elif action == "pick_visual":
         i = scene_index()
-        candidate = CANDIDATES.get(str(data.get("candidate", "")))
+        cid = str(data.get("candidate", ""))
+        candidate = next((x for x in pl.ai_items(p) if x["id"] == cid), None) if cid.startswith("ai:") \
+            else CANDIDATES.get(cid)
         if not candidate:   # only results this server found are used, never a URL sent by the browser
             raise ValueError("That search result has expired (the web UI may have restarted). Search again.")
         query = " ".join(str(data.get("query") or "").split())[:100]
@@ -901,13 +919,19 @@ def api_candidates(slug, scene):
     if source not in SOURCES:
         raise ValueError("Unknown source")
     query = " ".join((request.args.get("q") or visual.get("query") or "").split())[:100]
-    if not query:
-        raise ValueError("Enter some search words")
     try:
         page = min(max(int(request.args.get("page", 1)), 1), 20)
     except ValueError:
         page = 1
-    results, errors = pl.search_candidates(source, query, page)
+    if source == "ai":   # the images and clips generated for this project so far, newest first
+        results, errors = ([] if page > 1 else [dict(item, thumb=file_url(slug, p / "ai" / item["thumb"]) if item.get("thumb") else None,
+                                                    preview=file_url(slug, p / "ai" / item["file"]) if item["kind"] == "video" else None,
+                                                    title=item.get("prompt", "")[:120])
+                                               for item in reversed(pl.ai_items(p))]), []
+    else:
+        if not query:
+            raise ValueError("Enter some search words")
+        results, errors = pl.search_candidates(source, query, page)
     with _candidates_lock:
         for c in results:
             CANDIDATES[c["id"]] = c
@@ -926,7 +950,8 @@ def api_candidates(slug, scene):
     timeline = timeline_for(p, script)
     return jsonify({"query": query, "source": source, "page": page, "results": out, "errors": errors,
                     "scene_seconds": timeline[scene]["duration"] if scene < len(timeline) else None,
-                    "stock_providers": pl.stock_providers()})
+                    "stock_providers": pl.stock_providers(),
+                    "ai_prompt": pl.ai_prompt(dict(script["scenes"][scene], visual=dict(visual, query=query)))})
 
 
 @app.post("/api/projects/<slug>/scenes/<int:scene>/rank")
@@ -1072,6 +1097,8 @@ SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float",
     "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
+    "AI_VISUALS": "choice", "AI_IMAGE_MODEL": "text", "AI_VIDEO_MODEL": "text", "AI_IMAGE_COST": "float",
+    "AI_VIDEO_COST": "float",
 }
 
 
@@ -1098,7 +1125,9 @@ def current_settings() -> dict:
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
             "CROSSFADE": pl.CROSSFADE, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
-            "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK}
+            "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK, "AI_VISUALS": pl.AI_VISUALS,
+            "AI_IMAGE_MODEL": pl.AI_IMAGE_MODEL, "AI_VIDEO_MODEL": pl.AI_VIDEO_MODEL,
+            "AI_IMAGE_COST": pl.AI_IMAGE_COST, "AI_VIDEO_COST": pl.AI_VIDEO_COST}
 
 
 def write_env(updates: dict[str, str]) -> None:
@@ -1202,7 +1231,8 @@ def api_status():
     return jsonify({
         "keys": {"anthropic": bool(os.getenv("ANTHROPIC_API_KEY")), "elevenlabs": bool(pl.ELEVENLABS_API_KEY),
                  "voice_id": bool(pl.ELEVENLABS_VOICE_ID), "pexels": bool(pl.PEXELS_API_KEY),
-                 "pixabay": bool(pl.PIXABAY_API_KEY), "youtube_client": pl.YT_CLIENT_SECRETS.exists(),
+                 "pixabay": bool(pl.PIXABAY_API_KEY), "fal": bool(pl.FAL_KEY),
+                 "youtube_client": pl.YT_CLIENT_SECRETS.exists(),
                  "youtube_login": pl.YT_TOKEN.exists()},
         "models": {"writer": pl.ANTHROPIC_MODEL, "factcheck": pl.FACTCHECK_MODEL, "voice": pl.ELEVENLABS_MODEL},
         "ffmpeg": ffmpeg, "xfade": pl.ffmpeg_has_filter("xfade"),
@@ -1230,6 +1260,8 @@ def api_save_settings():
                 raise ValueError(f"{key} must be a number")
         elif kind == "choice":
             updates[key] = str(value).strip().lower()
+        elif kind == "text":
+            updates[key] = " ".join(str(value or "").split())[:200]
         elif kind == "providers":
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ValueError(f"{key} must be a list of provider names")

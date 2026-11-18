@@ -22,6 +22,7 @@ import argparse
 import base64
 import hashlib
 import html
+import io
 import itertools
 import json
 import math
@@ -81,7 +82,7 @@ def configure() -> None:
     global ANTHROPIC_MODEL, FACTCHECK_MODEL, FACTCHECK_SEARCHES, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
     global ELEVENLABS_MODEL, VOICE_STABILITY, VOICE_SIMILARITY, VOICE_STYLE, VOICE_SPEAKER_BOOST, VOICE_SPEED
     global VOICE_TONE, PEXELS_API_KEY, PIXABAY_API_KEY, MUSIC_PATH, MUSIC_VOLUME, MUSIC_DUCKING, CROSSFADE
-    global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE
+    global UNSPLASH_ACCESS_KEY, SMITHSONIAN_API_KEY, VISUAL_PROVIDERS, ALLOW_SHARE_ALIKE, AUTO_PICK, VISION_MODEL
     global RENDER_JOBS, YT_CLIENT_SECRETS, YT_TOKEN, THUMB_FONT, PROJECTS_DIR, MAX_ATTEMPTS
     ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
     FACTCHECK_MODEL = os.getenv("ANTHROPIC_FACTCHECK_MODEL", "claude-opus-5-5")
@@ -104,6 +105,9 @@ def configure() -> None:
     VISUAL_PROVIDERS = [p.strip().lower() for p in (os.getenv("VISUAL_PROVIDERS") or DEFAULT_PROVIDERS).split(",")
                         if p.strip() and p.strip().lower() != "none"]
     ALLOW_SHARE_ALIKE = _flag("ALLOW_SHARE_ALIKE", False)
+    # Claude looks at the search results' previews: off, rank (in the picker) or auto (also automatic fetches)
+    AUTO_PICK = (os.getenv("AUTO_PICK") or "off").strip().lower()
+    VISION_MODEL = os.getenv("ANTHROPIC_VISION_MODEL") or ANTHROPIC_MODEL
     MUSIC_PATH = _path("MUSIC_PATH", "") if os.getenv("MUSIC_PATH") else None
     MUSIC_VOLUME = float(os.getenv("MUSIC_VOLUME", "0.10"))
     MUSIC_DUCKING = _flag("MUSIC_DUCKING", True)
@@ -1144,7 +1148,90 @@ SOURCE_ALIASES = {"pexels_video": "stock_video", "pexels_photo": "stock_photo",
 FALLBACK_QUERIES = ["earth from space", "milky way", "planet earth", "stars night sky"]
 
 
+# --- Claude as picture editor: it looks at the results' previews and ranks the ones that fit -----------
+class VisualChoice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ranking: List[int] = Field(description="Numbers of the images that suit this moment of the narration, best first. "
+                                           "Leave out any that do not fit, are misleading, or show watermarks, "
+                                           "captions or logos.")
+    reason: str = Field(description="One short sentence: why the first one fits best, or why none fits")
+
+
+VISION_SYSTEM = """You are the picture editor of a faceless YouTube channel. For each moment of narration you choose the image that best shows what the narrator is talking about. Prefer images that are accurate for the subject (the right planet, animal, place, person or era), clear at a glance and uncluttered. Reject images with watermarks, burned-in captions or logos, and anything that would mislead viewers."""
+
+
+def preview_data(url: str, size: int = 512) -> str | None:
+    """A small JPEG of a result's preview image, base64-encoded for Claude, or None if it cannot be loaded."""
+    try:
+        r = HTTP.get(url, timeout=20)
+        r.raise_for_status()
+        from PIL import Image
+        with Image.open(io.BytesIO(r.content)) as img:
+            img = img.convert("RGB")
+            img.thumbnail((size, size))
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:   # any broken or blocked preview is simply left out
+        return None
+
+
+def rank_visuals(narration: str, query: str, candidates: list[dict], limit: int = 12) -> tuple[list[int], str]:
+    """Claude ranks the results whose previews fit the narration. Returns (indices into candidates, reason)."""
+    pairs = [(k, c) for k, c in enumerate(candidates) if c.get("thumb")][:limit]
+    if not pairs:
+        return [], "None of the results has a preview image"
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        datas = list(pool.map(lambda c: preview_data(c["thumb"]), [c for _, c in pairs]))
+    shown = [(k, c, data) for (k, c), data in zip(pairs, datas) if data]
+    if not shown:
+        return [], "None of the preview images could be loaded"
+    content = [{"type": "text", "text": f"Narration at this moment:\n{narration}\n\nSearch words: {query}\n\n"
+                                        f"{len(shown)} candidate images follow, numbered from 1. A video is shown "
+                                        "as one still frame."}]
+    for n, (k, c, data) in enumerate(shown, start=1):
+        label = f"Image {n}" + (f" (video, {c['duration']} s)" if c["kind"] == "video" and c.get("duration") else "")
+        if c.get("title"):
+            label += f": {str(c['title'])[:120]}"
+        content += [{"type": "text", "text": label},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}}]
+    content.append({"type": "text", "text": "Rank the images that suit this moment of the narration, best first."})
+    choice = claude_json(VISION_MODEL, VISION_SYSTEM, content, VisualChoice, max_tokens=1000)
+    order = list(dict.fromkeys(shown[n - 1][0] for n in choice.ranking if 1 <= n <= len(shown)))
+    return order, choice.reason
+
+
+def claude_pick(scene: dict, used: set, min_seconds: float) -> dict | None:
+    """Claude's choice among the unused results for this scene's own search (AUTO_PICK=auto), or None."""
+    visual = scene.get("visual") or {}
+    source = SOURCE_ALIASES.get(visual.get("source"), visual.get("source"))
+    query = (visual.get("query") or "").strip()
+    if source not in SEARCHERS or not query:
+        return None
+    results, _ = search_candidates(source, query)
+    fresh = [c for c in results if c["id"] not in used]
+    if not fresh:
+        return None
+    order, reason = rank_visuals(scene.get("narration", ""), query, fresh)
+    for k in order:
+        c = fresh[k]
+        url = c.get("url") or (nasa_image_url(c["collection"]) if c.get("collection") else None)
+        if url:
+            log(f"  Claude chose: {c['credit'][:90]} ({reason})")
+            picked = {key: c[key] for key in (*ASSET_FIELDS, "track") if key in c}
+            return dict(picked, url=url, query=query, source=source)
+    log(f"  Claude found none of the results suitable ({reason}); using the first result instead")
+    return None
+
+
 def find_visual(scene: dict, used: set, min_seconds: float) -> dict:
+    if AUTO_PICK == "auto" and os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            picked = claude_pick(scene, used, min_seconds)
+            if picked:
+                return picked
+        except Exception as e:   # Claude unavailable: fall back to the usual order rather than stopping the render
+            log(f"  Claude could not choose a visual ({type(e).__name__}: {str(e)[:150]}); using the first result")
     visual = scene.get("visual") or {}
     preferred = SOURCE_ALIASES.get(visual.get("source"), visual.get("source"))
     if preferred not in SEARCHERS:   # script.json may have been edited by hand
@@ -2242,6 +2329,8 @@ def settings_problems() -> list[str]:
         problems.append(f"VOICE_SPEED is {VOICE_SPEED:g}; ElevenLabs accepts 0.7 to 1.2")
     if CROSSFADE < 0 or CROSSFADE > 2:
         problems.append(f"CROSSFADE is {CROSSFADE:g}; use 0 (hard cuts) up to 2 seconds")
+    if AUTO_PICK not in ("off", "rank", "auto"):
+        problems.append(f"AUTO_PICK is '{AUTO_PICK}'; use off, rank or auto")
     unknown = [p for p in VISUAL_PROVIDERS if p not in PROVIDERS]
     if unknown:
         problems.append(f"VISUAL_PROVIDERS has unknown names ({', '.join(unknown)}); use: {', '.join(PROVIDERS)}")

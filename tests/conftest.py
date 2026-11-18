@@ -28,7 +28,7 @@ TEST_ENV = {
     "VOICE_STABILITY": "0.5", "VOICE_SIMILARITY": "0.75", "VOICE_STYLE": "0", "VOICE_SPEAKER_BOOST": "true",
     "VOICE_SPEED": "1.0", "RENDER_JOBS": "",
     "PEXELS_API_KEY": "", "PIXABAY_API_KEY": "", "UNSPLASH_ACCESS_KEY": "", "SMITHSONIAN_API_KEY": "",
-    "VISUAL_PROVIDERS": "", "ALLOW_SHARE_ALIKE": "",
+    "VISUAL_PROVIDERS": "", "ALLOW_SHARE_ALIKE": "", "AUTO_PICK": "", "ANTHROPIC_VISION_MODEL": "",
     "ANTHROPIC_API_KEY": "test-not-a-real-key", "ELEVENLABS_API_KEY": "test-not-a-real-key",
     "ELEVENLABS_VOICE_ID": "test-voice",
     "YT_CLIENT_SECRETS": str(TMP / "client_secret.json"), "YT_TOKEN": str(TMP / "youtube_token.json"),

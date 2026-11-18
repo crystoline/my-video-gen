@@ -929,6 +929,26 @@ def api_candidates(slug, scene):
                     "stock_providers": pl.stock_providers()})
 
 
+@app.post("/api/projects/<slug>/scenes/<int:scene>/rank")
+def api_rank_candidates(slug, scene):
+    """Claude looks at the previews of these search results and ranks the ones that fit the scene."""
+    p = project_dir(slug)
+    script = need_script(p)
+    if not 0 <= scene < len(script["scenes"]):
+        abort(404, "Unknown scene")
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        abort(409, "ANTHROPIC_API_KEY is not set")
+    data = body()
+    ids = [str(i) for i in (data.get("ids") or [])][:12]
+    with _candidates_lock:
+        cands = [CANDIDATES[i] for i in ids if i in CANDIDATES]
+    if not cands:
+        raise ValueError("Those search results have expired; search again")
+    query = " ".join(str(data.get("query") or "").split())[:100]
+    order, reason = pl.rank_visuals(script["scenes"][scene]["narration"], query, cands)
+    return jsonify({"order": [cands[k]["id"] for k in order], "reason": reason})
+
+
 @app.post("/api/projects/<slug>/scenes/<int:scene>/visual")
 def api_upload_visual(slug, scene):
     p = project_dir(slug)
@@ -1051,7 +1071,7 @@ SETTINGS = {   # .env name -> kind; only sound, voice, video and visual settings
     "MUSIC_PATH": "path", "MUSIC_VOLUME": "float", "MUSIC_DUCKING": "bool", "VOICE_TONE": "choice",
     "VOICE_STABILITY": "float", "VOICE_SIMILARITY": "float", "VOICE_STYLE": "float",
     "VOICE_SPEAKER_BOOST": "bool", "VOICE_SPEED": "float", "CROSSFADE": "float",
-    "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool",
+    "VISUAL_PROVIDERS": "providers", "ALLOW_SHARE_ALIKE": "bool", "AUTO_PICK": "choice",
 }
 
 
@@ -1078,7 +1098,7 @@ def current_settings() -> dict:
             "VOICE_SIMILARITY": pl.VOICE_SIMILARITY, "VOICE_STYLE": pl.VOICE_STYLE,
             "VOICE_SPEAKER_BOOST": pl.VOICE_SPEAKER_BOOST, "VOICE_SPEED": pl.VOICE_SPEED,
             "CROSSFADE": pl.CROSSFADE, "VISUAL_PROVIDERS": pl.VISUAL_PROVIDERS,
-            "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE}
+            "ALLOW_SHARE_ALIKE": pl.ALLOW_SHARE_ALIKE, "AUTO_PICK": pl.AUTO_PICK}
 
 
 def write_env(updates: dict[str, str]) -> None:

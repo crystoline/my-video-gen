@@ -685,6 +685,25 @@ async function openPicker(i) {
   const onKey = e => { if (e.key === "Escape") close(); };
   function close() { closed = true; overlay.remove(); document.removeEventListener("keydown", onKey); }
 
+  const claudeNote = h("div", { class: "small" });
+  const cards = new Map();   // result id -> card element
+  let lastIds = [];
+  async function askClaude() {
+    if (!lastIds.length) return;
+    claudeNote.replaceChildren(h("span", { class: "row muted" }, h("span", { class: "spinner" }), "Claude is looking at the previews…"));
+    try {
+      const r = await api("POST", `/api/projects/${encodeURIComponent(slug)}/scenes/${i}/rank`, { ids: lastIds, query: q.value });
+      if (closed) return;
+      const ranked = r.order.map(id => cards.get(id)).filter(Boolean);
+      cards.forEach(el => { el.classList.add("dim"); el.querySelectorAll(".rankchip").forEach(x => x.remove()); });
+      ranked.forEach((el, k) => {
+        el.classList.remove("dim");
+        el.querySelector(".pinfo").prepend(chip(k === 0 ? "Claude's pick" : `Claude #${k + 1}`, k === 0 ? "accent rankchip" : "rankchip"));
+      });
+      grid.prepend(...ranked);
+      claudeNote.replaceChildren(h("span", { class: "muted" }, ranked.length ? `Claude: ${r.reason}` : `Claude found none of these suitable: ${r.reason}`));
+    } catch (e) { if (!closed) claudeNote.replaceChildren(h("span", { class: "warn-text" }, e.message)); }
+  }
   async function search(p) {
     status.replaceChildren(h("span", { class: "row" }, h("span", { class: "spinner" }), "Searching…"));
     more.hidden = true;
@@ -693,17 +712,21 @@ async function openPicker(i) {
         new URLSearchParams({ q: q.value, source: src.value, page: p }));
       if (closed) return;
       page = p; sceneSeconds = r.scene_seconds;
-      if (p === 1) grid.replaceChildren();
-      r.results.forEach(c => grid.append(card(c)));
+      if (p === 1) { grid.replaceChildren(); cards.clear(); claudeNote.replaceChildren(); }
+      r.results.forEach(c => { const el = card(c); cards.set(c.id, el); grid.append(el); });
+      lastIds = r.results.map(c => c.id).slice(0, 12);
       const shown = grid.children.length;
       const notes = [];
-      if (src.value !== "nasa" && !r.stock_providers.length) notes.push("No stock footage key is set, so stock searches return nothing (see the README).");
+      if ((src.value === "stock_video" || src.value === "stock_photo") && !r.stock_providers.length) notes.push("No stock footage key is set, so stock searches only use the free archives (see the README).");
       notes.push(...r.errors);
+      const pickMode = (S.status && S.status.settings.AUTO_PICK) || "off";
       status.replaceChildren(
         shown ? `${shown} result(s). Click one to use it for scene ${i + 1}.` : "Nothing found. Try other or fewer words.",
         sceneSeconds ? ` The scene lasts ${Math.round(sceneSeconds)} s; shorter clips loop.` : "",
+        r.results.length && pickMode === "off" ? h("button", { class: "small", style: "margin-left:.5rem", onclick: askClaude }, "Ask Claude to pick") : null,
         ...notes.map(n => h("div", { class: "warn-text" }, n)));
       more.hidden = r.results.length === 0;
+      if (r.results.length && pickMode !== "off" && p === 1) askClaude();
     } catch (e) { if (!closed) status.replaceChildren(h("span", { class: "warn-text" }, e.message)); }
   }
 
@@ -743,7 +766,7 @@ async function openPicker(i) {
     h("div", { class: "narr muted small" }, s.narration),
     h("form", { class: "row", onsubmit: e => { e.preventDefault(); search(1); } },
       src, q, h("button", { class: "primary", type: "submit" }, "Search")),
-    status, grid, h("div", { class: "row", style: "justify-content:center" }, more)));
+    status, claudeNote, grid, h("div", { class: "row", style: "justify-content:center" }, more)));
   document.body.append(overlay);
   document.addEventListener("keydown", onKey);
   q.focus();
@@ -1056,6 +1079,12 @@ function providersPanel(vals) {
     h("p", { class: "muted small" }, "Ticked sources are searched in this order when a scene's visual is fetched automatically; the picker shows results from all of them. ",
       "Providers that need a key are skipped until the key is in .env (restart the web UI after adding one)."),
     box,
+    h("label", {}, h("span", {}, "Claude as picture editor (looks at up to 12 small previews per search; a small Claude cost each time)"),
+      h("select", { onchange: e => { vals.AUTO_PICK = e.target.value; } },
+        [["off", "Off: pick yourself (the picker still has an “Ask Claude to pick” button)"],
+         ["rank", "In the picker: Claude ranks every search and marks its pick"],
+         ["auto", "Also automatically: “Fetch visuals” and “Next result” use Claude's pick"]]
+          .map(([k, label]) => h("option", { value: k, selected: vals.AUTO_PICK === k ? true : null }, label)))),
     h("label", { class: "row" }, h("input", { type: "checkbox", checked: vals.ALLOW_SHARE_ALIKE, onchange: e => { vals.ALLOW_SHARE_ALIKE = e.target.checked; } }),
       h("span", { style: "margin:0" }, "Also use CC BY-SA (share-alike) images and footage from Wikimedia Commons and Openverse. ",
         h("span", { class: "muted small" }, "Many more results, but share-alike can require your video to carry the same licence. Public domain, CC0 and CC BY are always allowed; everything is credited in the description."))));

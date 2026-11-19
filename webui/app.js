@@ -40,6 +40,29 @@ function h(tag, attrs, ...kids) {
   return el;
 }
 
+// Pictures and videos of the project view. When the view is rebuilt (a job starts or ends, a save, a new pick),
+// the elements already on the page are moved into the new layout instead of being created again, so the other
+// scenes do not go black and load again, and a video that is playing keeps playing. Only a changed file
+// (its URL carries the file's version) gets a new element.
+let mediaPool = null;
+function media(tag, attrs) {
+  const key = `${tag} ${attrs.class || ""} ${attrs.src}`;
+  const kept = mediaPool && mediaPool.get(key);
+  if (kept && kept.length) return kept.shift();
+  const el = h(tag, attrs);
+  el.dataset.keep = key;
+  return el;
+}
+function withKeptMedia(root, build) {
+  mediaPool = new Map();
+  root.querySelectorAll("[data-keep]").forEach(el => {
+    const list = mediaPool.get(el.dataset.keep) || [];
+    list.push(el);
+    mediaPool.set(el.dataset.keep, list);
+  });
+  try { build(); } finally { mediaPool = null; }
+}
+
 async function api(method, url, body, isForm) {
   const opts = { method, headers: { "X-Requested-By": "myvideogen" } };
   if (body !== undefined) {
@@ -424,7 +447,7 @@ function renderProject() {
   const p = S.project;
   if (!p) return;
   const tabs = [["script", "Script"], ["visuals", "Visuals"], ["video", "Video"], ["short", "Short"], ["log", "Log"]];
-  $app.replaceChildren(
+  withKeptMedia($app, () => $app.replaceChildren(
     h("div", { class: "row between" },
       h("div", {}, h("h1", {}, (S.draft && S.draft.title) || p.title),
         h("div", { class: "muted small row" }, p.topic ? `Topic: ${p.topic}` : "", p.scenes ? ` · ${p.scenes} scenes · ${p.words} words · ~${p.minutes} min` : "",
@@ -439,7 +462,7 @@ function renderProject() {
     nextStep(p),
     h("nav", { class: "tabs" }, tabs.map(([k, label]) => h("a", { href: `#/p/${p.slug}/${k}`, class: S.tab === k ? "active" : "" }, label))),
     h("div", { id: "tabbody" }, S.tab === "visuals" ? visualsTab(p) : S.tab === "video" ? videoTab(p)
-      : S.tab === "short" ? shortTab(p) : S.tab === "log" ? logTab(p) : scriptTab(p)));
+      : S.tab === "short" ? shortTab(p) : S.tab === "log" ? logTab(p) : scriptTab(p))));
   updateJobBanner();
   if (S.dirty) showSaveBar();
 }
@@ -715,21 +738,21 @@ function visualCard(s, i) {
       makeDraft(); renderProject(); toast(`Scene ${i + 1} now uses your file`);
     } catch (err) { toast(err.message, true); }
   } });
-  let media;
-  if (!a || !a.url) media = h("div", { class: "media" }, "No visual yet");
-  else if (a.kind === "video") media = h("div", { class: "media" }, h("video", { src: a.url, muted: true, loop: true, controls: true, preload: "metadata" }));
-  else media = h("div", { class: "media" }, h("img", { src: a.url, alt: "", loading: "lazy" }));
+  let view;
+  if (!a || !a.url) view = h("div", { class: "media" }, "No visual yet");
+  else if (a.kind === "video") view = h("div", { class: "media" }, media("video", { src: a.url, muted: true, loop: true, controls: true, preload: "metadata" }));
+  else view = h("div", { class: "media" }, media("img", { src: a.url, alt: "", loading: "lazy" }));
   const wanted = info ? info.shots_wanted || 1 : 1;
   const extras = a && wanted > 1 ? h("div", { class: "shots" },
     Array.from({ length: wanted - 1 }, (_, k) => {
       const sh = (a.shots || [])[k];
       const n = k + 2;
       return h("div", { class: "shot" },
-        h("div", { class: "smedia" }, sh && sh.url ? (sh.kind === "video" ? h("video", { src: sh.url, muted: true, preload: "metadata" })
-          : h("img", { src: sh.url, alt: "", loading: "lazy" })) : h("span", { class: "muted small" }, "fetched at render")),
+        h("div", { class: "smedia" }, sh && sh.url ? (sh.kind === "video" ? media("video", { src: sh.url, muted: true, preload: "metadata" })
+          : media("img", { src: sh.url, alt: "", loading: "lazy" })) : h("span", { class: "muted small" }, "fetched at render")),
         h("button", { class: "small", title: sh ? sh.credit : "", onclick: () => openPicker(i, n) }, `Shot ${n}…`));
     })) : null;
-  return h("div", { class: "vcard" }, media, extras,
+  return h("div", { class: "vcard" }, view, extras,
     h("div", { class: "body" },
       h("div", { class: "row between" }, h("strong", {}, `Scene ${i + 1}`),
         h("span", {}, a ? chip(a.source === "custom" ? "your file" : a.source === "ai" ? `AI ${a.kind}` : a.kind, a.source === "ai" ? "warn" : "") : null,
@@ -953,7 +976,7 @@ function videoTab(p) {
         p.preview_url ? h("audio", { controls: true, src: p.preview_url, preload: "none" }) : null),
       h("p", { class: "muted small" }, "Rendering reuses every scene that did not change, so a re-render after small edits only redoes the affected scenes, then joins and mixes.")),
     p.final_url ? h("div", { class: "panel" },
-      h("video", { class: "player", controls: true, preload: "metadata", src: p.final_url }),
+      media("video", { class: "player", controls: true, preload: "metadata", src: p.final_url }),
       h("div", { class: "row", style: "margin-top:.5rem" },
         h("a", { class: "btn small", href: p.final_url, download: `${p.slug}.mp4` }, "Download MP4"),
         p.captions_url ? h("a", { class: "btn small", href: p.captions_url, download: `${p.slug}.srt` }, "Download captions") : null)) : null,
@@ -1059,7 +1082,7 @@ function thumbnailPanel(p) {
   const d = S.draft;
   if (!d) return null;
   return h("div", { class: "panel row", style: "align-items:flex-start" },
-    p.thumbnail_url ? h("img", { class: "thumbimg", src: p.thumbnail_url, alt: "Thumbnail" }) : h("div", { class: "muted" }, "The thumbnail is made when the video renders."),
+    p.thumbnail_url ? media("img", { class: "thumbimg", src: p.thumbnail_url, alt: "Thumbnail" }) : h("div", { class: "muted" }, "The thumbnail is made when the video renders."),
     h("div", { class: "stack grow" },
       h("h2", {}, "Thumbnail"),
       h("label", {}, h("span", {}, "Text"), h("input", { value: d.thumbnail_text || "", maxlength: 60, style: "width:100%",
@@ -1147,7 +1170,7 @@ function shortTab(p) {
         h("span", { class: "muted small" }, stateText),
         p.voice_todo.length ? h("span", { class: "warn-text small" }, "Generate the voiceover first.") : null)),
     sh.url ? h("div", { class: "panel" },
-      h("video", { class: "player vertical", controls: true, preload: "metadata", src: sh.url }),
+      media("video", { class: "player vertical", controls: true, preload: "metadata", src: sh.url }),
       h("div", { class: "row", style: "margin-top:.5rem" },
         h("a", { class: "btn small", href: sh.url, download: `${p.slug}-short.mp4` }, "Download MP4"))) : null,
     uploadPanel(p, st, "short"));

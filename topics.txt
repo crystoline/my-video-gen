@@ -1,6 +1,90 @@
 # One topic per line. Each scheduled run takes the top one and moves it to topics_done.txt.
+# Questions I would obsess over
+# questions I’d genuinely want answers to:
+# I’d also be very interested in questions about life:
+# Then there are the questions that make excellent YouTube videos because they are both scientific and emotionally compelling:
+# Some of the most interesting questions are surprisingly simple:
 Why is Mars red?
 How do auroras actually form?
 What would happen if the Moon disappeared?
 How do we know the age of the universe?
 Why does Earth have seasons?
+Why is space black?
+What happens if the Moon disappears?
+Can a planet exist without a star?
+How does the universe know which way time should go?
+What is the loneliest place in the universe?
+Could Earth survive without Jupiter?
+Can a black hole die?
+What happens after the universe ends?
+Could there be planets older than the Sun?
+What is consciousness, physically?
+Why do the laws of physics exist at all?
+Could reality be fundamentally mathematical?
+Is time actually real?
+Could the universe be a simulation?
+Is there a smallest possible unit of space?
+Can space itself be created or destroyed?
+What happens when the last star dies?
+Could humanity ever leave the Milky Way?
+Could we ever travel faster than light?
+Are wormholes physically possible?
+Could time travel ever happen?
+What is at the center of a black hole?
+How did life first begin from non-living chemistry?
+Why are the constants of nature exactly what they are?
+Why is there something instead of nothing?
+What existed before the Big Bang, if “before” even makes sense?
+Does the universe have an edge? If so, what is beyond it?
+Is the universe infinite?
+Are there other universes?
+Why does time move in only one direction?
+What actually happens inside a black hole?
+Where does information go when something falls into a black hole?
+What would I actually see if I fell into a black hole?
+Can anything survive near a black hole?
+Why is gravity so much weaker than the other fundamental forces?
+What exactly is dark matter?
+What exactly is dark energy?
+Why is the expansion of the universe accelerating?
+Will the universe eventually die?
+What will the last thing in the universe be?
+If intelligent aliens exist, why haven’t we found them?
+How common is life in the universe?
+Could life exist without water?
+Could there be life inside Europa or Enceladus?
+Was there ever life on Mars?
+Could an alien civilization already know Earth exists?
+What would alien life actually look like?
+Would intelligent life inevitably invent technology?
+Could a civilization survive for millions of years?
+Could we recognize alien technology if we saw it?
+What if the first alien life we discover is artificial rather than biological?
+What would happen if the Sun suddenly disappeared?
+What would happen if Earth stopped spinning?
+What if Earth had two moons?
+What if Jupiter disappeared?
+What if the Moon were twice as close to Earth?
+What if Earth fell into a black hole?
+What if the Sun became a black hole?
+Could humans survive on Mars?
+Could we terraform Mars?
+What would happen if you took off your helmet in space?
+Can you cry in space?
+Can fire burn in space?
+Can you hear anything in space?
+How cold is space really?
+What does space smell like?
+What does the Sun actually sound like?
+Why is the sky blue?
+Why is Mars red?
+Why is space black if there are billions of stars?
+Why does the Moon sometimes look huge?
+Why don't planets fall into the Sun?
+Why doesn't the Moon fall onto Earth?
+Why are planets round?
+Why do Saturn's rings stay flat?
+Why do stars twinkle but planets usually don't?
+Why can't we see stars during the day?
+Why does the Moon have so many craters but Earth doesn't?
+Why is Venus hotter than Mercury?

@@ -169,6 +169,26 @@ def test_project_files_stream_with_ranges_and_cannot_escape_the_folder(client, f
     assert client.get("/api/projects/NOT_A_SLUG").status_code == 404
 
 
+def test_project_files_are_kept_by_the_browser_only_under_their_current_version(client, fakes):
+    slug, P = new_project(client)
+    run_job(client, slug, action="visuals")
+    scene_url = lambda: client.get(f"/api/projects/{slug}").get_json()["scene_info"][2]["asset"]["url"]
+    url = scene_url()
+    r = client.get(url)
+    assert r.status_code == 200
+    assert "immutable" in r.headers["Cache-Control"] and "max-age=31536000" in r.headers["Cache-Control"]
+    # Without a version, or with one that is not the file's, the browser has to ask again
+    bare = url.split("?")[0]
+    for other in (bare, bare + "?v=1-2"):
+        cc = client.get(other).headers["Cache-Control"]
+        assert "immutable" not in cc and ("no-cache" in cc or "max-age=0" in cc)
+    # A replaced file gets a new URL, and the old URL is no longer kept
+    path = P / bare.split(f"/files/{slug}/", 1)[1]
+    path.write_bytes(path.read_bytes() + b"\0" * 16)
+    assert scene_url() != url
+    assert "immutable" not in client.get(url).headers["Cache-Control"]
+
+
 def test_a_video_cannot_be_edited_or_get_a_second_job_while_one_runs(client, fakes):
     slug, P = new_project(client)
     fakes.factcheck_delay = 1.5

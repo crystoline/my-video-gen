@@ -172,11 +172,20 @@ def mtime(path: Path) -> float:
         return 0.0
 
 
+def file_version(path: Path) -> str:
+    """Changes whenever the file is replaced or rewritten (exact modification time and size)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    return f"{st.st_mtime_ns:x}-{st.st_size:x}"
+
+
 def file_url(slug: str, path: Path) -> str | None:
     if not path.exists():
         return None
     rel = path.relative_to(pl.PROJECTS_DIR / slug).as_posix()
-    return f"/files/{slug}/{rel}?v={int(mtime(path))}"
+    return f"/files/{slug}/{rel}?v={file_version(path)}"
 
 
 def timeline_for(p: Path, script: dict) -> list[dict]:
@@ -770,6 +779,12 @@ def project_file(slug, rel):
     path = (p / rel).resolve()
     if p not in path.parents or not path.is_file():
         abort(404)
+    # A URL from file_url() names one exact version of the file, and a replaced file gets a new URL,
+    # so the browser may keep it instead of asking again each time the page is drawn.
+    if request.args.get("v") == file_version(path):
+        resp = send_file(path, max_age=365 * 24 * 3600, conditional=True)
+        resp.cache_control.immutable = True
+        return resp
     return send_file(path, max_age=0, conditional=True)
 
 
